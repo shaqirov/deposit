@@ -1,7 +1,10 @@
 """Исполнение сделок: бумажная торговля и Binance USDⓈ-M Futures через ccxt."""
 import logging
+from dataclasses import asdict
 
 import ccxt
+
+from .strategy import Signal
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +56,20 @@ class PaperBroker:
             exit_price = s.stop if high >= s.stop else s.take if low <= s.take else None
         if exit_price is None:
             return None
+        return self._close(exit_price)
+
+    def close_now(self, price):
+        """Закрыть позицию по рынку. Возвращает PnL."""
+        return self._close(price) if self.position else None
+
+    def unrealized_pnl(self, price):
+        if not self.position:
+            return 0.0
+        s, amount = self.position["signal"], self.position["amount"]
+        return (price - s.entry) * amount * (1 if s.side == "long" else -1)
+
+    def _close(self, exit_price):
+        s, amount = self.position["signal"], self.position["amount"]
         direction = 1 if s.side == "long" else -1
         gross = (exit_price - s.entry) * amount * direction
         exit_fee = exit_price * amount * TAKER_FEE
@@ -61,6 +78,17 @@ class PaperBroker:
         total = gross - exit_fee - s.entry * amount * TAKER_FEE
         log.info("[paper] закрыта по %.2f, PnL %.4f, баланс %.4f", exit_price, total, self.balance)
         return total
+
+    def to_state(self):
+        pos = self.position
+        return {"balance": self.balance,
+                "position": {"signal": asdict(pos["signal"]), "amount": pos["amount"]} if pos else None}
+
+    def load_state(self, state, with_position=True):
+        self.balance = state["balance"]
+        pos = state.get("position")
+        if pos and with_position:
+            self.position = {"signal": Signal(**pos["signal"]), "amount": pos["amount"]}
 
 
 class BinanceBroker:
@@ -82,11 +110,36 @@ class BinanceBroker:
         bal = self.ex.fetch_balance()
         return float(bal["total"].get("USDT", 0))
 
-    def _has_position(self):
+    def _position(self):
         for p in self.ex.fetch_positions([self.symbol]):
             if abs(float(p.get("contracts") or 0)) > 0:
-                return True
-        return False
+                return p
+        return None
+
+    def _has_position(self):
+        return self._position() is not None
+
+    def unrealized_pnl(self, price=None):
+        p = self._position()
+        return float(p.get("unrealizedPnl") or 0) if p else 0.0
+
+    def close_now(self, price=None):
+        """Закрыть позицию по рынку. PnL посчитает следующий check_exit."""
+        p = self._position()
+        if p:
+            side = "sell" if p.get("side") == "long" else "buy"
+            self.ex.create_order(self.symbol, "market", side, abs(float(p["contracts"])), None,
+                                 {"reduceOnly": True})
+            log.info("Позиция закрыта вручную по рынку")
+        self.cancel_all()
+        return None
+
+    def to_state(self):
+        return {"equity_before": self.equity_before}
+
+    def load_state(self, state, with_position=True):
+        if with_position and "equity_before" in state:
+            self.equity_before = state["equity_before"]
 
     def open(self, signal, amount):
         amount = float(self.ex.amount_to_precision(self.symbol, amount))

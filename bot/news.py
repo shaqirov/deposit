@@ -33,3 +33,28 @@ def blocking_event(events, now, hours_before, hours_after):
         if -hours_after <= delta_h <= hours_before:
             return title or when.isoformat()
     return None
+
+
+def add_event(path, when_text, title):
+    """Добавить событие. when_text — 'ГГГГ-ММ-ДД ЧЧ:ММ' (UTC). Ошибка формата — ValueError."""
+    datetime.strptime(when_text, "%Y-%m-%d %H:%M")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"{when_text}  {title}\n")
+
+
+def remove_event(path, index):
+    """Удалить событие по номеру (с 1) в порядке файла. Возвращает удалённую строку или None."""
+    with open(path, encoding="utf-8") as f:
+        lines = f.readlines()
+    n = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        n += 1
+        if n == index:
+            del lines[i]
+            with open(path, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+            return stripped
+    return None

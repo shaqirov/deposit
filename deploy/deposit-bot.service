@@ -8,9 +8,9 @@ Type=simple
 User=bot
 WorkingDirectory=/opt/deposit
 ExecStart=/opt/deposit/.venv/bin/python -m bot.main
-# Перезапуск при сбое; при штатной остановке по лимитам риска бот не перезапускается
+# Перезапуск при сбое и по командам /restart, /set, /update из Telegram (код выхода 3)
 Restart=on-failure
-RestartSec=30
+RestartSec=5
 Environment=PYTHONUNBUFFERED=1
 
 [Install]

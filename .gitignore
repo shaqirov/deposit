@@ -6,3 +6,7 @@ state.json
 *.log
 journal.csv
 trades.csv
+state.json.tmp
+bot.log*
+.cache/
+.venv/

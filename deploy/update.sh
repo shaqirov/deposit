@@ -7,5 +7,7 @@ git pull --ff-only
 .venv/bin/pip install -q -r requirements.txt
 chown -R bot:bot "$APP_DIR"
 sudo -u bot .venv/bin/python -m pytest -q
+sed "s|/opt/deposit|$APP_DIR|g" deploy/deposit-bot.service > /etc/systemd/system/deposit-bot.service
+systemctl daemon-reload
 systemctl restart deposit-bot
 echo "Обновлено и перезапущено. Лог: sudo journalctl -u deposit-bot -f"

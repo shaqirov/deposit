@@ -1,21 +1,28 @@
+import random
+
 from bot.broker import PaperBroker, TAKER_FEE
-from bot.indicators import atr, ema, rsi
+from bot.indicators import atr, ema
 from bot.risk import RiskGuard, position_size
-from bot.strategy import Signal, StrategyParams, generate_signal
+from bot.strategy import Signal, StrategyParams, generate_signal, generate_signals
 
 
 def candle(i, close, spread=1.0):
     return [i, close, close + spread, close - spread, close, 1.0]
 
 
+def random_candles(n, seed, drift=0.0, vol=0.01, step_ms=1):
+    random.seed(seed)
+    price, out = 100.0, []
+    for i in range(n):
+        o = price
+        price *= 1 + random.gauss(drift, vol)
+        out.append([i * step_ms, o, max(o, price) * 1.003, min(o, price) * 0.997, price, 1.0])
+    return out
+
+
 def test_ema_constant_series():
     assert ema([5.0] * 10, 3)[-1] == 5.0
     assert ema([1.0, 2.0], 3) == [None, None]
-
-
-def test_rsi_extremes():
-    assert rsi(list(range(1, 30)), 14)[-1] == 100.0
-    assert rsi(list(range(30, 1, -1)), 14)[-1] == 0.0
 
 
 def test_atr_constant_range():
@@ -43,16 +50,15 @@ def test_risk_guard():
     assert g.stop_reason(100) is None
 
 
-def test_long_signal_on_upward_cross():
-    p = StrategyParams()
-    closes = [100 - i * 0.5 for i in range(40)] + [80 + i * 0.6 for i in range(1, 30)]
-    candles = [candle(i, c) for i, c in enumerate(closes)]
-    signals = [generate_signal(candles[:k], p) for k in range(p.warmup, len(candles) + 1)]
-    longs = [s for s in signals if s and s.side == "long"]
-    assert longs, "ожидался сигнал на покупку после разворота вверх"
-    s = longs[0]
-    assert s.stop < s.entry < s.take
-    assert abs((s.take - s.entry) - 2 * (s.entry - s.stop)) < 1e-9
+def test_risk_guard_pause_after_losses():
+    hour = 3600 * 1000
+    g = RiskGuard(100, 100, 50, max_consecutive_losses=2, pause_hours=48)
+    g.record_trade(-1, 0)
+    assert not g.is_paused(hour)
+    g.record_trade(-1, hour)
+    assert g.is_paused(10 * hour)
+    assert not g.is_paused(50 * hour)
+    assert g.stop_reason(98) is None  # при паузе серия убытков не останавливает бота
 
 
 def test_paper_broker_take_and_stop():
@@ -69,95 +75,53 @@ def test_paper_broker_take_and_stop():
     assert b.check_exit(106, 89) < 0
 
 
-def test_breakout_signal_on_new_high_in_uptrend():
-    p = StrategyParams(name="breakout", trend_ema=50, donchian_period=10)
+def uptrend_breakout():
     closes = [100 + i * 0.1 for i in range(80)] + [100 + 7.9 + 0.1] * 5 + [112.0]
-    candles = [candle(i, c, spread=0.2) for i, c in enumerate(closes)]
-    s = generate_signal(candles, p)
+    return [candle(i, c, spread=0.2) for i, c in enumerate(closes)]
+
+
+def downtrend_breakdown():
+    closes = [100 - i * 0.1 for i in range(80)] + [100 - 7.9 - 0.1] * 5 + [88.0]
+    return [candle(i, c, spread=0.2) for i, c in enumerate(closes)]
+
+
+def test_long_on_breakout_in_uptrend():
+    p = StrategyParams(trend_ema=50, donchian_period=10)
+    s = generate_signal(uptrend_breakout(), p)
     assert s and s.side == "long" and s.stop < s.entry < s.take
-
-
-def test_mean_reversion_takes_profit_at_middle_band():
-    p = StrategyParams(name="mean_reversion")
-    closes = [100 + (0.5 if i % 2 else -0.5) for i in range(40)] + [99, 98, 97, 96, 95, 92]
-    candles = [candle(i, c, spread=0.3) for i, c in enumerate(closes)]
-    s = generate_signal(candles, p)
-    assert s and s.side == "long"
-    assert s.stop < s.entry < s.take
-
-
-def test_signals_match_between_batch_and_incremental():
-    import random
-    random.seed(7)
-    price, candles = 100.0, []
-    for i in range(400):
-        price *= 1 + random.gauss(0, 0.01)
-        candles.append(candle(i, price, spread=price * 0.005))
-    from bot.strategy import STRATEGIES, generate_signals
-    for name in STRATEGIES:
-        p = StrategyParams(name=name, trend_ema=50, trend_sma_days=50)
-        batch = generate_signals(candles, p)
-        for k in range(p.warmup, len(candles), 37):
-            assert generate_signal(candles[:k + 1], p) == batch[k]
-
-
-def uptrend_with_pullback():
-    """Плавный рост, затем откат к EMA и бычья свеча, отскочившая от неё."""
-    candles = []
-    for i in range(120):
-        c = 100 + i * 0.5
-        candles.append([i, c - 0.3, c + 0.4, c - 0.6, c, 1.0])
-    for k, c in enumerate([158.0, 157.0, 156.0, 155.0], start=120):
-        candles.append([k, c + 0.5, c + 0.8, c - 0.3, c, 1.0])
-    # Свеча проколола EMA вниз и закрылась выше открытия
-    candles.append([124, 154.6, 156.8, 151.0, 156.5, 1.0])
-    return candles
-
-
-def trend_params(**kw):
-    return StrategyParams(name="trend_pullback", trend_sma_days=50, swing_lookback=10,
-                          pullback_ema=20, **kw)
-
-
-def test_trend_pullback_long_on_bounce_from_ema():
-    from bot.indicators import ema
-    candles = uptrend_with_pullback()
-    closes = [c[4] for c in candles]
-    assert candles[-1][3] <= ema(closes, 20)[-1] < closes[-1]
-    s = generate_signal(candles, trend_params())
-    assert s and s.side == "long"
-    assert s.stop < min(c[3] for c in candles[-10:])
     assert abs((s.take - s.entry) - 2 * (s.entry - s.stop)) < 1e-9
 
 
-def test_trend_pullback_never_trades_against_trend():
-    from bot.strategy import generate_signals
-    candles = uptrend_with_pullback()
-    assert all(s is None or s.side == "long" for s in generate_signals(candles, trend_params()))
+def test_short_on_breakdown_in_downtrend():
+    p = StrategyParams(trend_ema=50, donchian_period=10)
+    s = generate_signal(downtrend_breakdown(), p)
+    assert s and s.side == "short" and s.take < s.entry < s.stop
 
 
-def test_funding_filter_blocks_overheated_longs():
-    candles = uptrend_with_pullback()
-    p = trend_params(max_funding_pct=0.05)
-    assert generate_signal(candles, p, funding_rate=0.0001)
-    assert generate_signal(candles, p, funding_rate=0.001) is None
-    assert generate_signal(candles, trend_params(max_funding_pct=0), funding_rate=0.001)
+def test_no_trade_against_trend():
+    # Пробой вверх, но цена ниже EMA тренда — лонг не открывается
+    closes = [130 - i * 0.3 for i in range(80)] + [106.0] * 5 + [107.0]
+    candles = [candle(i, c, spread=0.2) for i, c in enumerate(closes)]
+    p = StrategyParams(trend_ema=50, donchian_period=5)
+    assert all(s is None or s.side == "short" for s in generate_signals(candles, p))
 
 
-def test_trend_sma_period_follows_timeframe():
-    assert StrategyParams(trend_sma_days=200, candles_per_day=6).trend_sma_period == 1200
-    assert StrategyParams(trend_sma_days=200, candles_per_day=1).trend_sma_period == 200
+def test_funding_filter():
+    p = StrategyParams(trend_ema=50, donchian_period=10, max_funding_pct=0.05)
+    assert generate_signal(uptrend_breakout(), p, funding_rate=0.0001)
+    assert generate_signal(uptrend_breakout(), p, funding_rate=0.001) is None
+    assert generate_signal(downtrend_breakdown(), p, funding_rate=-0.001) is None
+    p.max_funding_pct = 0
+    assert generate_signal(uptrend_breakout(), p, funding_rate=0.001)
 
 
-def test_risk_guard_pause_after_losses():
-    hour = 3600 * 1000
-    g = RiskGuard(100, 100, 50, max_consecutive_losses=2, pause_hours=48)
-    g.record_trade(-1, 0)
-    assert not g.is_paused(hour)
-    g.record_trade(-1, hour)
-    assert g.is_paused(10 * hour)
-    assert not g.is_paused(50 * hour)
-    assert g.stop_reason(98) is None  # при паузе серия убытков не останавливает бота
+def test_signals_match_between_batch_and_incremental():
+    candles = random_candles(400, seed=7)
+    p = StrategyParams(trend_ema=50)
+    batch = generate_signals(candles, p)
+    assert any(batch)
+    for k in range(p.warmup, len(candles), 7):
+        assert generate_signal(candles[:k + 1], p) == batch[k]
 
 
 def test_news_blackout(tmp_path):
@@ -176,20 +140,11 @@ def test_news_blackout(tmp_path):
 
 def test_backtest_journal_and_halves(tmp_path):
     import csv
-    import random
     from bot.backtest import run_backtest
     from bot.config import load_config
-    random.seed(3)
-    price, candles = 100.0, []
-    for i in range(3000):
-        o = price
-        price *= 1 + random.gauss(0.0005, 0.01)
-        candles.append([i * 4 * 3600 * 1000, o, max(o, price) * 1.003,
-                        min(o, price) * 0.997, price, 1.0])
+    candles = random_candles(3000, seed=3, drift=0.0005, step_ms=4 * 3600 * 1000)
     cfg = load_config()
-    cfg.strategy = trend_params()
-    cfg.strategy.trend_sma_days = 200
-    cfg.strategy.candles_per_day = 6
+    cfg.strategy = StrategyParams()
     journal = tmp_path / "trades.csv"
     r = run_backtest(candles, cfg, stop_on_guard=False, journal=str(journal))
     rows = list(csv.DictReader(open(journal, encoding="utf-8")))

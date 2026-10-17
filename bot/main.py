@@ -32,9 +32,8 @@ def main():
     )
     cfg = load_config()
     if cfg.strategy.warmup + 1 > MAX_CANDLES:
-        raise SystemExit(f"Стратегии {cfg.strategy.name} на {cfg.timeframe} нужно "
-                         f"{cfg.strategy.warmup} свечей истории, а Binance отдаёт {MAX_CANDLES}. "
-                         "Возьмите таймфрейм старше (4h или 1d).")
+        raise SystemExit(f"Стратегии нужно {cfg.strategy.warmup} свечей истории, "
+                         f"а Binance отдаёт {MAX_CANDLES}. Уменьшите TREND_EMA.")
     limit = min(max(500, cfg.strategy.warmup + 100), MAX_CANDLES)
     ex = make_exchange(cfg)
     if cfg.mode == "paper":
@@ -50,9 +49,8 @@ def main():
     guard = RiskGuard(start, cfg.target_profit_pct, cfg.max_drawdown_pct,
                       cfg.max_consecutive_losses, cfg.pause_hours)
     events = load_events(cfg.news_file)
-    log.info("Старт: режим=%s, %s %s, стратегия %s, депозит %.2f USDT, риск %.1f%%, "
-             "событий в %s: %d", cfg.mode, cfg.symbol, cfg.timeframe, cfg.strategy.name,
-             start, cfg.risk_per_trade_pct, cfg.news_file, len(events))
+    log.info("Старт: режим=%s, %s %s, депозит %.2f USDT, риск %.1f%%, "
+             "событий в %s: %d", cfg.mode, cfg.symbol, cfg.timeframe, start, cfg.risk_per_trade_pct, cfg.news_file, len(events))
 
     last_candle_ts = None
     open_trade = None  # (signal, amount, open_ms) для журнала

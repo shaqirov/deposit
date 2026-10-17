@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from .broker import BinanceBroker, PaperBroker, make_exchange
 from .config import load_config
-from .journal import append_trade, trade_row
+from .journal import append_trade, fmt_ts, trade_row
 from .news import blocking_event, load_events
 from .risk import RiskGuard, position_size
 from .strategy import generate_signal
@@ -93,6 +93,10 @@ def main():
                                                cfg.risk_per_trade_pct, cfg.leverage)
                         if broker.open(sig, amount) is not False:
                             open_trade = (sig, amount, now_ms)
+                    else:
+                        log.info("Свеча %s UTC закрыта по %.2f, funding %s: сигнала нет",
+                                 fmt_ts(closed[-1][0]), closed[-1][4],
+                                 "—" if funding is None else f"{funding * 100:.4f}%")
         except KeyboardInterrupt:
             raise
         except Exception:

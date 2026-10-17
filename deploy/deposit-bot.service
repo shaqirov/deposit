@@ -1,0 +1,17 @@
+[Unit]
+Description=Binance Futures trading bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bot
+WorkingDirectory=/opt/deposit
+ExecStart=/opt/deposit/.venv/bin/python -m bot.main
+# Перезапуск при сбое; при штатной остановке по лимитам риска бот не перезапускается
+Restart=on-failure
+RestartSec=30
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

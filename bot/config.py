@@ -51,7 +51,7 @@ def load_config():
         news_hours_before=float(env("NEWS_HOURS_BEFORE", "12")),
         news_hours_after=float(env("NEWS_HOURS_AFTER", "4")),
         strategy=StrategyParams(
-            name=env("STRATEGY", "trend_pullback").lower(),
+            name=env("STRATEGY", "breakout").lower(),
             ema_fast=int(env("EMA_FAST", "9")),
             ema_slow=int(env("EMA_SLOW", "21")),
             rsi_period=int(env("RSI_PERIOD", "14")),

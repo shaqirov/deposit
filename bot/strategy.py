@@ -8,16 +8,24 @@ breakout        Пробой канала Дончиана: закрытие в�
 mean_reversion  Возврат к среднему: закрытие за полосой Боллинджера при
                 перепроданности/перекупленности по RSI, тейк — средняя линия.
                 Высокий винрейт, небольшие прибыли.
+trend_pullback  Следование за трендом на старших таймфреймах (4h, 1d). Тренд —
+                цена выше 200-дневной SMA и максимумы растут (для шорта
+                зеркально). Вход на откате: свеча коснулась EMA и закрылась
+                обратно в сторону тренда. Стоп за локальным минимумом
+                (максимумом) с запасом 0.5 ATR, тейк — TAKE_PROFIT_RR стопов.
 
-Во всех стратегиях стоп = STOP_ATR_MULT * ATR от входа. Тейк для ema_cross и
+Фильтр funding для всех стратегий: лонг не открывается при ставке выше
+MAX_FUNDING_PCT (перегретые лонги), шорт — при ставке ниже -MAX_FUNDING_PCT.
+
+Во всех остальных стратегиях стоп = STOP_ATR_MULT * ATR от входа. Тейк для ema_cross и
 breakout — TAKE_PROFIT_RR стопов, для mean_reversion — средняя полоса.
 """
 from dataclasses import dataclass
 from statistics import pstdev
 
-from .indicators import atr, ema, rsi
+from .indicators import atr, ema, rsi, sma
 
-STRATEGIES = ("ema_cross", "breakout", "mean_reversion")
+STRATEGIES = ("ema_cross", "breakout", "mean_reversion", "trend_pullback")
 
 
 @dataclass
@@ -33,6 +41,16 @@ class StrategyParams:
     trend_ema: int = 200
     bb_period: int = 20
     bb_std: float = 2.0
+    trend_sma_days: int = 200
+    swing_lookback: int = 10
+    pullback_ema: int = 20
+    allow_shorts: bool = True
+    max_funding_pct: float = 0.05  # за 8 часов; 0 — фильтр выключен
+    candles_per_day: float = 1.0   # выставляется из таймфрейма
+
+    @property
+    def trend_sma_period(self):
+        return max(1, round(self.trend_sma_days * self.candles_per_day))
 
     @property
     def warmup(self):
@@ -43,6 +61,8 @@ class StrategyParams:
             periods += [self.trend_ema, self.donchian_period]
         elif self.name == "mean_reversion":
             periods += [self.bb_period]
+        elif self.name == "trend_pullback":
+            periods += [self.trend_sma_period, self.swing_lookback * 2, self.pullback_ema]
         return max(periods) + 2
 
 
@@ -54,17 +74,22 @@ class Signal:
     take: float
 
 
-def generate_signal(candles, p: StrategyParams):
-    """Сигнал на последней закрытой свече (вход по её цене закрытия) или None."""
+def generate_signal(candles, p: StrategyParams, funding_rate=None):
+    """Сигнал на последней закрытой свече (вход по её цене закрытия) или None.
+
+    funding_rate — текущая ставка финансирования (доля, 0.0001 = 0.01%).
+    """
     if len(candles) < p.warmup:
         return None
-    return generate_signals(candles, p)[-1]
+    funding = [None] * (len(candles) - 1) + [funding_rate]
+    return generate_signals(candles, p, funding)[-1]
 
 
-def generate_signals(candles, p: StrategyParams):
+def generate_signals(candles, p: StrategyParams, funding=None):
     """Сигналы для каждой свечи за один проход — используется в бэктесте.
 
     candles — список закрытых свечей [ts, open, high, low, close, volume].
+    funding — ставки финансирования для каждой свечи (или None).
     """
     if p.name not in STRATEGIES:
         raise ValueError(f"Неизвестная стратегия {p.name}, доступны: {', '.join(STRATEGIES)}")
@@ -74,15 +99,21 @@ def generate_signals(candles, p: StrategyParams):
     atrs = atr(highs, lows, closes, p.atr_period)
     rsis = rsi(closes, p.rsi_period)
     make = {"ema_cross": _ema_cross, "breakout": _breakout,
-            "mean_reversion": _mean_reversion}[p.name]
-    check = make(highs, lows, closes, rsis, p)
+            "mean_reversion": _mean_reversion, "trend_pullback": _trend_pullback}[p.name]
+    check = make(candles, highs, lows, closes, atrs, p)
+    max_funding = p.max_funding_pct / 100
 
     out = [None] * len(candles)
     for i in range(p.warmup - 1, len(candles)):
         a, r = atrs[i], rsis[i]
         if a is None or r is None or a <= 0:
             continue
-        out[i] = check(i, closes[i], a * p.stop_atr_mult, r)
+        sig = check(i, closes[i], a * p.stop_atr_mult, r)
+        if sig and funding and funding[i] is not None and max_funding > 0:
+            if (sig.side == "long" and funding[i] > max_funding) or \
+                    (sig.side == "short" and funding[i] < -max_funding):
+                sig = None
+        out[i] = sig
     return out
 
 
@@ -92,7 +123,7 @@ def _with_rr(side, price, risk, rr):
     return Signal("short", price, price + risk, price - risk * rr)
 
 
-def _ema_cross(highs, lows, closes, rsis, p):
+def _ema_cross(candles, highs, lows, closes, atrs, p):
     fast = ema(closes, p.ema_fast)
     slow = ema(closes, p.ema_slow)
 
@@ -107,7 +138,7 @@ def _ema_cross(highs, lows, closes, rsis, p):
     return check
 
 
-def _breakout(highs, lows, closes, rsis, p):
+def _breakout(candles, highs, lows, closes, atrs, p):
     trend = ema(closes, p.trend_ema)
     n = p.donchian_period
 
@@ -124,7 +155,7 @@ def _breakout(highs, lows, closes, rsis, p):
     return check
 
 
-def _mean_reversion(highs, lows, closes, rsis, p):
+def _mean_reversion(candles, highs, lows, closes, atrs, p):
     n = p.bb_period
 
     def check(i, price, risk, r):
@@ -138,5 +169,31 @@ def _mean_reversion(highs, lows, closes, rsis, p):
             return Signal("long", price, price - risk, mid)
         if price > mid + dev and r > 70 and price - mid >= risk * 0.5:
             return Signal("short", price, price + risk, mid)
+        return None
+    return check
+
+
+def _trend_pullback(candles, highs, lows, closes, atrs, p):
+    trend = sma(closes, p.trend_sma_period)
+    pull = ema(closes, p.pullback_ema)
+    n = p.swing_lookback
+
+    def check(i, price, risk, r):
+        if trend[i] is None or pull[i] is None or i < 2 * n:
+            return None
+        recent_high, prev_high = max(highs[i - n + 1:i + 1]), max(highs[i - 2 * n + 1:i - n + 1])
+        recent_low, prev_low = min(lows[i - n + 1:i + 1]), min(lows[i - 2 * n + 1:i - n + 1])
+        opened = candles[i][1]
+        buffer = atrs[i] * 0.5
+        if price > trend[i] and recent_high > prev_high \
+                and lows[i] <= pull[i] < price and price > opened:
+            stop = recent_low - buffer
+            if stop < price:
+                return Signal("long", price, stop, price + (price - stop) * p.take_profit_rr)
+        if p.allow_shorts and price < trend[i] and recent_low < prev_low \
+                and highs[i] >= pull[i] > price and price < opened:
+            stop = recent_high + buffer
+            if stop > price:
+                return Signal("short", price, stop, price - (stop - price) * p.take_profit_rr)
         return None
     return check

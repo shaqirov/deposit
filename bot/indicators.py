@@ -60,3 +60,16 @@ def atr(highs, lows, closes, period=14):
         prev = (prev * (period - 1) + trs[i]) / period
         out[i] = prev
     return out
+
+
+def sma(values, period):
+    """Простая скользящая средняя. Первые period-1 значений — None."""
+    out = [None] * len(values)
+    if len(values) < period:
+        return out
+    s = sum(values[:period])
+    out[period - 1] = s / period
+    for i in range(period, len(values)):
+        s += values[i] - values[i - period]
+        out[i] = s / period
+    return out

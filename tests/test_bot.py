@@ -95,7 +95,104 @@ def test_signals_match_between_batch_and_incremental():
         candles.append(candle(i, price, spread=price * 0.005))
     from bot.strategy import STRATEGIES, generate_signals
     for name in STRATEGIES:
-        p = StrategyParams(name=name, trend_ema=50)
+        p = StrategyParams(name=name, trend_ema=50, trend_sma_days=50)
         batch = generate_signals(candles, p)
         for k in range(p.warmup, len(candles), 37):
             assert generate_signal(candles[:k + 1], p) == batch[k]
+
+
+def uptrend_with_pullback():
+    """Плавный рост, затем откат к EMA и бычья свеча, отскочившая от неё."""
+    candles = []
+    for i in range(120):
+        c = 100 + i * 0.5
+        candles.append([i, c - 0.3, c + 0.4, c - 0.6, c, 1.0])
+    for k, c in enumerate([158.0, 157.0, 156.0, 155.0], start=120):
+        candles.append([k, c + 0.5, c + 0.8, c - 0.3, c, 1.0])
+    # Свеча проколола EMA вниз и закрылась выше открытия
+    candles.append([124, 154.6, 156.8, 151.0, 156.5, 1.0])
+    return candles
+
+
+def trend_params(**kw):
+    return StrategyParams(name="trend_pullback", trend_sma_days=50, swing_lookback=10,
+                          pullback_ema=20, **kw)
+
+
+def test_trend_pullback_long_on_bounce_from_ema():
+    from bot.indicators import ema
+    candles = uptrend_with_pullback()
+    closes = [c[4] for c in candles]
+    assert candles[-1][3] <= ema(closes, 20)[-1] < closes[-1]
+    s = generate_signal(candles, trend_params())
+    assert s and s.side == "long"
+    assert s.stop < min(c[3] for c in candles[-10:])
+    assert abs((s.take - s.entry) - 2 * (s.entry - s.stop)) < 1e-9
+
+
+def test_trend_pullback_never_trades_against_trend():
+    from bot.strategy import generate_signals
+    candles = uptrend_with_pullback()
+    assert all(s is None or s.side == "long" for s in generate_signals(candles, trend_params()))
+
+
+def test_funding_filter_blocks_overheated_longs():
+    candles = uptrend_with_pullback()
+    p = trend_params(max_funding_pct=0.05)
+    assert generate_signal(candles, p, funding_rate=0.0001)
+    assert generate_signal(candles, p, funding_rate=0.001) is None
+    assert generate_signal(candles, trend_params(max_funding_pct=0), funding_rate=0.001)
+
+
+def test_trend_sma_period_follows_timeframe():
+    assert StrategyParams(trend_sma_days=200, candles_per_day=6).trend_sma_period == 1200
+    assert StrategyParams(trend_sma_days=200, candles_per_day=1).trend_sma_period == 200
+
+
+def test_risk_guard_pause_after_losses():
+    hour = 3600 * 1000
+    g = RiskGuard(100, 100, 50, max_consecutive_losses=2, pause_hours=48)
+    g.record_trade(-1, 0)
+    assert not g.is_paused(hour)
+    g.record_trade(-1, hour)
+    assert g.is_paused(10 * hour)
+    assert not g.is_paused(50 * hour)
+    assert g.stop_reason(98) is None  # при паузе серия убытков не останавливает бота
+
+
+def test_news_blackout(tmp_path):
+    from datetime import datetime, timezone
+    from bot.news import blocking_event, load_events
+    f = tmp_path / "news.txt"
+    f.write_text("# comment\n2026-10-28 18:00  FOMC\nbad line\n", encoding="utf-8")
+    events = load_events(str(f))
+    assert len(events) == 1
+    at = lambda h: datetime(2026, 10, 28, h, tzinfo=timezone.utc)
+    assert blocking_event(events, at(8), 12, 4) == "FOMC"
+    assert blocking_event(events, at(21), 12, 4) == "FOMC"
+    assert blocking_event(events, at(5), 12, 4) is None
+    assert load_events(str(tmp_path / "missing.txt")) == []
+
+
+def test_backtest_journal_and_halves(tmp_path):
+    import csv
+    import random
+    from bot.backtest import run_backtest
+    from bot.config import load_config
+    random.seed(3)
+    price, candles = 100.0, []
+    for i in range(3000):
+        o = price
+        price *= 1 + random.gauss(0.0005, 0.01)
+        candles.append([i * 4 * 3600 * 1000, o, max(o, price) * 1.003,
+                        min(o, price) * 0.997, price, 1.0])
+    cfg = load_config()
+    cfg.strategy = trend_params()
+    cfg.strategy.trend_sma_days = 200
+    cfg.strategy.candles_per_day = 6
+    journal = tmp_path / "trades.csv"
+    r = run_backtest(candles, cfg, stop_on_guard=False, journal=str(journal))
+    rows = list(csv.DictReader(open(journal, encoding="utf-8")))
+    assert len(rows) == r["trades"] > 0
+    total = (1 + r["first_half_pct"] / 100) * (1 + r["second_half_pct"] / 100)
+    assert abs(total - (1 + r["return_pct"] / 100)) < 1e-9

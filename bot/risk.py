@@ -26,12 +26,21 @@ class RiskGuard:
     target_profit_pct: float
     max_drawdown_pct: float
     max_consecutive_losses: int
+    # > 0: после серии убытков перерыв на столько часов; 0 — полная остановка
+    pause_hours: float = 0
     consecutive_losses: int = 0
+    paused_until_ms: int = 0
     trades: list = field(default_factory=list)
 
-    def record_trade(self, pnl):
+    def record_trade(self, pnl, ts_ms=0):
         self.trades.append(pnl)
         self.consecutive_losses = self.consecutive_losses + 1 if pnl < 0 else 0
+        if self.pause_hours > 0 and self.consecutive_losses >= self.max_consecutive_losses:
+            self.paused_until_ms = ts_ms + int(self.pause_hours * 3600 * 1000)
+            self.consecutive_losses = 0
+
+    def is_paused(self, ts_ms):
+        return ts_ms < self.paused_until_ms
 
     def stop_reason(self, equity):
         """Причина остановки или None, если торговлю можно продолжать."""
@@ -40,6 +49,6 @@ class RiskGuard:
             return f"цель достигнута: +{change_pct:.1f}%"
         if change_pct <= -self.max_drawdown_pct:
             return f"превышена просадка: {change_pct:.1f}%"
-        if self.consecutive_losses >= self.max_consecutive_losses:
+        if self.pause_hours <= 0 and self.consecutive_losses >= self.max_consecutive_losses:
             return f"{self.consecutive_losses} убыточных сделок подряд"
         return None

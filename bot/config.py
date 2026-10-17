@@ -23,6 +23,8 @@ class Config:
     news_file: str
     news_hours_before: float
     news_hours_after: float
+    telegram_token: str
+    telegram_chat_id: str
     strategy: StrategyParams
 
 
@@ -48,6 +50,8 @@ def load_config():
         news_file=env("NEWS_FILE", "news.txt"),
         news_hours_before=float(env("NEWS_HOURS_BEFORE", "12")),
         news_hours_after=float(env("NEWS_HOURS_AFTER", "4")),
+        telegram_token=env("TELEGRAM_BOT_TOKEN", ""),
+        telegram_chat_id=env("TELEGRAM_CHAT_ID", ""),
         strategy=StrategyParams(
             atr_period=int(env("ATR_PERIOD", "14")),
             stop_atr_mult=float(env("STOP_ATR_MULT", "1.5")),

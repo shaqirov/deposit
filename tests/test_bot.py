@@ -151,3 +151,28 @@ def test_backtest_journal_and_halves(tmp_path):
     assert len(rows) == r["trades"] > 0
     total = (1 + r["first_half_pct"] / 100) * (1 + r["second_half_pct"] / 100)
     assert abs(total - (1 + r["return_pct"] / 100)) < 1e-9
+
+
+def test_telegram_notifier(monkeypatch):
+    import bot.telegram as tgmod
+    sent = []
+    monkeypatch.setattr(tgmod, "call", lambda token, method, payload=None, timeout=10:
+                        sent.append((method, payload)))
+    tgmod.Notifier("", "").send("ignored")  # без токена ничего не отправляется
+    assert sent == []
+
+    n = tgmod.Notifier("token", "42")
+    n.send("hello")
+    assert sent == [("sendMessage", {"chat_id": "42", "text": "hello"})]
+    n.error("boom")
+    n.error("boom again")  # повторная ошибка в течение часа не отправляется
+    assert len(sent) == 2
+
+
+def test_telegram_failure_does_not_raise(monkeypatch):
+    import bot.telegram as tgmod
+
+    def broken(*args, **kwargs):
+        raise OSError("network down")
+    monkeypatch.setattr(tgmod, "call", broken)
+    tgmod.Notifier("token", "42").send("hello")

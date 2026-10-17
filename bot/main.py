@@ -9,6 +9,7 @@ from .journal import append_trade, fmt_ts, trade_row
 from .news import blocking_event, load_events
 from .risk import RiskGuard, position_size
 from .strategy import generate_signal
+from .telegram import Notifier
 
 log = logging.getLogger("bot")
 POLL_SECONDS = 10
@@ -51,8 +52,13 @@ def main():
     events = load_events(cfg.news_file)
     log.info("Старт: режим=%s, %s %s, депозит %.2f USDT, риск %.1f%%, "
              "событий в %s: %d", cfg.mode, cfg.symbol, cfg.timeframe, start, cfg.risk_per_trade_pct, cfg.news_file, len(events))
+    tg = Notifier(cfg.telegram_token, cfg.telegram_chat_id)
+    tg.send(f"🚀 Бот запущен\nРежим: {cfg.mode}\n{cfg.symbol} {cfg.timeframe}\n"
+            f"Депозит: {start:.2f} USDT, риск {cfg.risk_per_trade_pct}% на сделку")
 
     last_candle_ts = None
+    last_report_day = datetime.now(timezone.utc).date()
+    day_trades = []
     open_trade = None  # (signal, amount, open_ms) для журнала
     while True:
         try:
@@ -66,16 +72,32 @@ def main():
                 equity = broker.equity()
                 log.info("Сделка %+.4f USDT, депозит %.2f (%+.1f%% от старта)",
                          pnl, equity, (equity / start - 1) * 100)
+                day_trades.append(pnl)
                 if open_trade:
                     append_trade(JOURNAL_FILE, trade_row(cfg.symbol, *open_trade,
                                                          now_ms, pnl, equity))
                     open_trade = None
+                tg.send(f"{'✅' if pnl >= 0 else '❌'} Сделка закрыта: {pnl:+.2f} USDT\n"
+                        f"Депозит: {equity:.2f} USDT ({(equity / start - 1) * 100:+.1f}% от старта)")
                 if guard.is_paused(now_ms):
                     log.warning("Серия убытков — перерыв %.0f ч", cfg.pause_hours)
+                    tg.send(f"⏸ {cfg.max_consecutive_losses} убытка подряд — "
+                            f"перерыв {cfg.pause_hours:.0f} ч")
                 reason = guard.stop_reason(equity)
                 if reason:
                     log.warning("Бот остановлен: %s", reason)
+                    tg.send(f"🛑 Бот остановлен: {reason}\nДепозит: {equity:.2f} USDT")
                     return
+
+            today = datetime.now(timezone.utc).date()
+            if today != last_report_day:
+                last_report_day = today
+                equity = broker.equity()
+                tg.send(f"📊 Сводка за сутки\nСделок: {len(day_trades)}, "
+                        f"результат {sum(day_trades):+.2f} USDT\n"
+                        f"Депозит: {equity:.2f} USDT ({(equity / start - 1) * 100:+.1f}% от старта)\n"
+                        f"Позиция: {'открыта' if broker.in_position else 'нет'}")
+                day_trades = []
 
             if not broker.in_position and closed[-1][0] != last_candle_ts:
                 last_candle_ts = closed[-1][0]
@@ -93,14 +115,18 @@ def main():
                                                cfg.risk_per_trade_pct, cfg.leverage)
                         if broker.open(sig, amount) is not False:
                             open_trade = (sig, amount, now_ms)
+                            tg.send(f"{'🟢 Лонг' if sig.side == 'long' else '🔴 Шорт'} {cfg.symbol}\n"
+                                    f"Вход: {sig.entry:.6g}\nСтоп: {sig.stop:.6g}\n"
+                                    f"Тейк: {sig.take:.6g}\nОбъём: {amount:.6g}")
                     else:
                         log.info("Свеча %s UTC закрыта по %.2f, funding %s: сигнала нет",
                                  fmt_ts(closed[-1][0]), closed[-1][4],
                                  "—" if funding is None else f"{funding * 100:.4f}%")
         except KeyboardInterrupt:
             raise
-        except Exception:
+        except Exception as e:
             log.exception("Ошибка в цикле, повтор через %d с", POLL_SECONDS)
+            tg.error(f"{type(e).__name__}: {e}"[:500])
         time.sleep(POLL_SECONDS)
 
 

@@ -117,7 +117,7 @@ sudo bash /opt/deposit/deploy/update.sh    # обновление кода из 
    и получите токен.
 2. Напишите своему новому боту любое сообщение.
 3. Узнайте chat_id: `python -m bot.telegram <TOKEN>`
-   (на сервере: `/opt/deposit/.venv/bin/python -m bot.telegram <TOKEN>`).
+   (на сервере: `cd /opt/deposit && .venv/bin/python -m bot.telegram <TOKEN>`).
 4. Впишите `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID` в `.env` и перезапустите бота.
 
 Если Telegram недоступен, бот продолжает торговать и пишет предупреждение в лог.

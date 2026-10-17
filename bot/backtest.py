@@ -8,7 +8,7 @@ import time
 from .broker import PaperBroker, make_exchange
 from .config import load_config
 from .risk import RiskGuard, position_size
-from .strategy import generate_signal
+from .strategy import generate_signals
 
 
 def fetch_history(exchange, symbol, timeframe, days):
@@ -30,7 +30,7 @@ def run_backtest(candles, cfg, stop_on_guard=True):
     guard = RiskGuard(cfg.paper_balance, cfg.target_profit_pct,
                       cfg.max_drawdown_pct, cfg.max_consecutive_losses)
     peak, max_dd, stop_reason = cfg.paper_balance, 0.0, None
-    window = cfg.strategy.warmup + 100
+    signals = generate_signals(candles, cfg.strategy)
 
     for i in range(cfg.strategy.warmup, len(candles)):
         c = candles[i]
@@ -41,11 +41,12 @@ def run_backtest(candles, cfg, stop_on_guard=True):
                 eq = broker.equity()
                 peak = max(peak, eq)
                 max_dd = max(max_dd, (peak - eq) / peak * 100)
-                stop_reason = guard.stop_reason(eq)
-                if stop_reason and stop_on_guard:
-                    break
+                if stop_on_guard:
+                    stop_reason = guard.stop_reason(eq)
+                    if stop_reason:
+                        break
             continue
-        sig = generate_signal(candles[max(0, i - window):i + 1], cfg.strategy)
+        sig = signals[i]
         if sig:
             amount = position_size(broker.equity(), sig.entry, sig.stop,
                                    cfg.risk_per_trade_pct, cfg.leverage)

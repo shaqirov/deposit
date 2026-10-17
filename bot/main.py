@@ -36,7 +36,7 @@ def main():
     last_candle_ts = None
     while True:
         try:
-            candles = ex.fetch_ohlcv(cfg.symbol, cfg.timeframe, limit=cfg.strategy.warmup + 100)
+            candles = ex.fetch_ohlcv(cfg.symbol, cfg.timeframe, limit=max(500, cfg.strategy.warmup + 100))
             closed, current = candles[:-1], candles[-1]
 
             pnl = broker.check_exit(current[2], current[3])

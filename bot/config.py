@@ -41,11 +41,16 @@ def load_config():
         max_consecutive_losses=int(env("MAX_CONSECUTIVE_LOSSES", "4")),
         paper_balance=float(env("PAPER_BALANCE", "100")),
         strategy=StrategyParams(
+            name=env("STRATEGY", "ema_cross").lower(),
             ema_fast=int(env("EMA_FAST", "9")),
             ema_slow=int(env("EMA_SLOW", "21")),
             rsi_period=int(env("RSI_PERIOD", "14")),
             atr_period=int(env("ATR_PERIOD", "14")),
             stop_atr_mult=float(env("STOP_ATR_MULT", "1.5")),
             take_profit_rr=float(env("TAKE_PROFIT_RR", "2.0")),
+            donchian_period=int(env("DONCHIAN_PERIOD", "20")),
+            trend_ema=int(env("TREND_EMA", "200")),
+            bb_period=int(env("BB_PERIOD", "20")),
+            bb_std=float(env("BB_STD", "2.0")),
         ),
     )

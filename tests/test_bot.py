@@ -67,3 +67,35 @@ def test_paper_broker_take_and_stop():
     b.open(Signal("short", 100, 105, 90), 1)
     # оба уровня в одной свече -> консервативно считаем стоп
     assert b.check_exit(106, 89) < 0
+
+
+def test_breakout_signal_on_new_high_in_uptrend():
+    p = StrategyParams(name="breakout", trend_ema=50, donchian_period=10)
+    closes = [100 + i * 0.1 for i in range(80)] + [100 + 7.9 + 0.1] * 5 + [112.0]
+    candles = [candle(i, c, spread=0.2) for i, c in enumerate(closes)]
+    s = generate_signal(candles, p)
+    assert s and s.side == "long" and s.stop < s.entry < s.take
+
+
+def test_mean_reversion_takes_profit_at_middle_band():
+    p = StrategyParams(name="mean_reversion")
+    closes = [100 + (0.5 if i % 2 else -0.5) for i in range(40)] + [99, 98, 97, 96, 95, 92]
+    candles = [candle(i, c, spread=0.3) for i, c in enumerate(closes)]
+    s = generate_signal(candles, p)
+    assert s and s.side == "long"
+    assert s.stop < s.entry < s.take
+
+
+def test_signals_match_between_batch_and_incremental():
+    import random
+    random.seed(7)
+    price, candles = 100.0, []
+    for i in range(400):
+        price *= 1 + random.gauss(0, 0.01)
+        candles.append(candle(i, price, spread=price * 0.005))
+    from bot.strategy import STRATEGIES, generate_signals
+    for name in STRATEGIES:
+        p = StrategyParams(name=name, trend_ema=50)
+        batch = generate_signals(candles, p)
+        for k in range(p.warmup, len(candles), 37):
+            assert generate_signal(candles[:k + 1], p) == batch[k]

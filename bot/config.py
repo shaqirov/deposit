@@ -11,7 +11,10 @@ class Config:
     api_key: str
     api_secret: str
     mode: str
-    symbol: str
+    symbol: str          # для одиночного бэктеста (bot.backtest, bot.compare)
+    symbols: str         # для бота: TOP30 (самые ликвидные) или список BTC,ETH,SOL
+    max_positions: int
+    max_total_risk_pct: float
     timeframe: str
     leverage: int
     risk_per_trade_pct: float
@@ -39,13 +42,16 @@ def load_config():
         api_secret=env("BINANCE_API_SECRET", ""),
         mode=mode,
         symbol=env("SYMBOL", "BTC/USDT:USDT"),
+        symbols=env("SYMBOLS", "TOP30").upper(),
+        max_positions=int(env("MAX_POSITIONS", "6")),
+        max_total_risk_pct=float(env("MAX_TOTAL_RISK_PCT", "20")),
         timeframe=env("TIMEFRAME", "4h"),
-        leverage=int(env("LEVERAGE", "3")),
-        risk_per_trade_pct=float(env("RISK_PER_TRADE_PCT", "1")),
+        leverage=int(env("LEVERAGE", "10")),
+        risk_per_trade_pct=float(env("RISK_PER_TRADE_PCT", "2")),
         target_profit_pct=float(env("TARGET_PROFIT_PCT", "100")),
-        max_drawdown_pct=float(env("MAX_DRAWDOWN_PCT", "25")),
-        max_consecutive_losses=int(env("MAX_CONSECUTIVE_LOSSES", "3")),
-        pause_hours=float(env("PAUSE_HOURS", "48")),
+        max_drawdown_pct=float(env("MAX_DRAWDOWN_PCT", "50")),
+        max_consecutive_losses=int(env("MAX_CONSECUTIVE_LOSSES", "10")),
+        pause_hours=float(env("PAUSE_HOURS", "24")),
         paper_balance=float(env("PAPER_BALANCE", "100")),
         news_file=env("NEWS_FILE", "news.txt"),
         news_hours_before=float(env("NEWS_HOURS_BEFORE", "12")),

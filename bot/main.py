@@ -1,64 +1,86 @@
-"""Основной цикл бота с управлением через Telegram.  Запуск: python -m bot.main"""
+"""Бот: стратегия на многих монетах с общим депозитом и управлением через Telegram.
+
+Запуск: python -m bot.main
+"""
 import csv
 import logging
 import os
 import subprocess
 import sys
-from dataclasses import asdict
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 
-from .broker import BinanceBroker, PaperBroker, make_exchange
+from .broker import BinancePortfolio, PaperPortfolio, make_exchange
 from .config import load_config
 from .journal import append_trade, fmt_ts, trade_row
 from .news import add_event, blocking_event, load_events, remove_event
-from .risk import RiskGuard, position_size
+from .portfolio import min_notional, top_symbols
+from .risk import RiskGuard, portfolio_size
 from .state import ENV_FILE, ROOT, STATE_FILE, load_state, save_state, set_env_value
-from .strategy import Signal, generate_signal
+from .strategy import generate_signal
 from .telegram import Notifier
 
 log = logging.getLogger("bot")
 POLL_SECONDS = 10
-MAX_CANDLES = 1500  # больше Binance не отдаёт за один запрос
+MAX_CANDLES = 1500   # больше Binance не отдаёт за один запрос
+SCAN_DELAY_MS = 15_000  # ждём после закрытия свечи, пока биржа её сформирует
 JOURNAL_FILE = os.path.join(ROOT, "journal.csv")
 LOG_FILE = os.path.join(ROOT, "bot.log")
 RESTART_EXIT_CODE = 3  # systemd перезапускает бота при ненулевом коде выхода
+STATE_VERSION = 2
 
 TIMEFRAMES = ("1h", "2h", "4h", "6h", "8h", "12h", "1d")
 # Настройки, которые можно менять из Telegram: ключ -> (тип, минимум, максимум, описание).
 # MODE и API-ключи — только на сервере.
 SETTINGS = {
-    "RISK_PER_TRADE_PCT": (float, 0.1, 5, "риск на сделку, %"),
-    "LEVERAGE": (int, 1, 10, "максимальное плечо"),
-    "MAX_DRAWDOWN_PCT": (float, 5, 90, "остановка при просадке, %"),
-    "TARGET_PROFIT_PCT": (float, 0, 10000, "остановка при прибыли, % (0 — без цели)"),
-    "MAX_CONSECUTIVE_LOSSES": (int, 1, 20, "убытков подряд до перерыва"),
+    "RISK_PER_TRADE_PCT": (float, 0.1, 10, "риск на сделку, %"),
+    "MAX_POSITIONS": (int, 1, 20, "позиций одновременно"),
+    "MAX_TOTAL_RISK_PCT": (float, 1, 100, "суммарный риск открытых позиций, %"),
+    "LEVERAGE": (int, 1, 20, "максимальное плечо"),
+    "TARGET_PROFIT_PCT": (float, 0, 10000, "остановка при прибыли, % (100 = x2, 0 — без цели)"),
+    "MAX_DRAWDOWN_PCT": (float, 5, 90, "аварийная остановка при просадке, %"),
+    "MAX_CONSECUTIVE_LOSSES": (int, 1, 50, "убытков подряд до перерыва"),
     "PAUSE_HOURS": (float, 0, 720, "длина перерыва, ч (0 — полная остановка)"),
     "MAX_FUNDING_PCT": (float, 0, 1, "фильтр funding, % за 8ч (0 — выкл.)"),
     "DONCHIAN_PERIOD": (int, 5, 200, "период канала, свечей"),
     "TAKE_PROFIT_RR": (float, 1, 10, "тейк в стопах"),
     "STOP_ATR_MULT": (float, 0.5, 10, "стоп в ATR"),
-    "SYMBOL": (str, None, None, "монета, например BTC или SOL"),
+    "SYMBOLS": (str, None, None, "TOP30 или список: BTC,ETH,SOL"),
     "TIMEFRAME": (str, None, None, "таймфрейм: " + ", ".join(TIMEFRAMES)),
 }
 SETTINGS_ATTR = {
-    "RISK_PER_TRADE_PCT": "risk_per_trade_pct", "LEVERAGE": "leverage",
-    "MAX_DRAWDOWN_PCT": "max_drawdown_pct", "TARGET_PROFIT_PCT": "target_profit_pct",
+    "RISK_PER_TRADE_PCT": "risk_per_trade_pct", "MAX_POSITIONS": "max_positions",
+    "MAX_TOTAL_RISK_PCT": "max_total_risk_pct", "LEVERAGE": "leverage",
+    "TARGET_PROFIT_PCT": "target_profit_pct", "MAX_DRAWDOWN_PCT": "max_drawdown_pct",
     "MAX_CONSECUTIVE_LOSSES": "max_consecutive_losses", "PAUSE_HOURS": "pause_hours",
-    "SYMBOL": "symbol", "TIMEFRAME": "timeframe",
+    "SYMBOLS": "symbols", "TIMEFRAME": "timeframe",
     "MAX_FUNDING_PCT": "strategy.max_funding_pct", "DONCHIAN_PERIOD": "strategy.donchian_period",
     "TAKE_PROFIT_RR": "strategy.take_profit_rr", "STOP_ATR_MULT": "strategy.stop_atr_mult",
 }
+# Наборы настроек одной командой /preset
+PRESETS = {
+    "razgon": ("разгон: риск 2%, цель x2, аварийная остановка -50%", {
+        "SYMBOLS": "TOP30", "RISK_PER_TRADE_PCT": 2, "MAX_POSITIONS": 6, "MAX_TOTAL_RISK_PCT": 20,
+        "LEVERAGE": 10, "TARGET_PROFIT_PCT": 100, "MAX_DRAWDOWN_PCT": 50,
+        "MAX_CONSECUTIVE_LOSSES": 10, "PAUSE_HOURS": 24}),
+    "safe": ("осторожно: риск 1%, без цели, аварийная остановка -25%", {
+        "SYMBOLS": "TOP30", "RISK_PER_TRADE_PCT": 1, "MAX_POSITIONS": 6, "MAX_TOTAL_RISK_PCT": 10,
+        "LEVERAGE": 5, "TARGET_PROFIT_PCT": 0, "MAX_DRAWDOWN_PCT": 25,
+        "MAX_CONSECUTIVE_LOSSES": 10, "PAUSE_HOURS": 24}),
+}
 
 COMMANDS = [
-    ("status", "депозит, позиция, состояние"),
+    ("status", "депозит, позиции, состояние"),
     ("trades", "последние сделки и статистика"),
     ("journal", "журнал сделок файлом (Excel)"),
+    ("coins", "монеты, которыми торгует бот"),
     ("pause", "не открывать новые сделки"),
     ("resume", "возобновить торговлю"),
-    ("close", "закрыть позицию по рынку"),
+    ("close", "закрыть позицию: /close SOL да или /close all да"),
     ("settings", "текущие настройки"),
     ("set", "изменить настройку: /set КЛЮЧ ЗНАЧЕНИЕ"),
+    ("preset", "набор настроек: /preset razgon или /preset safe"),
+    ("reset", "paper: начать заново со стартовым депозитом"),
     ("news", "события, вокруг которых бот не торгует"),
     ("news_add", "добавить событие: /news_add 2026-11-12 13:30 CPI"),
     ("news_del", "удалить событие: /news_del НОМЕР"),
@@ -73,7 +95,7 @@ def current_funding(ex, symbol):
     try:
         return ex.fetch_funding_rate(symbol).get("fundingRate")
     except Exception as e:
-        log.warning("Не удалось получить funding: %s", e)
+        log.warning("%s: не удалось получить funding: %s", symbol, e)
         return None
 
 
@@ -84,6 +106,36 @@ def get_attr(cfg, path):
     return obj
 
 
+def short(symbol):
+    return symbol.split("/")[0]
+
+
+def resolve_symbols(ex, spec):
+    """TOP30 -> 30 самых ликвидных монет; 'BTC,ETH' -> список фьючерсов к USDT."""
+    spec = spec.upper().replace(" ", "")
+    if spec.startswith("TOP"):
+        return top_symbols(ex, int(spec[3:] or 30))
+    ex.load_markets()
+    symbols = [t if "/" in t else f"{t}/USDT:USDT" for t in spec.split(",") if t]
+    return [s for s in symbols if s in ex.markets]
+
+
+def validate_symbols_spec(ex, raw):
+    """Нормализованное значение SYMBOLS или текст ошибки."""
+    spec = raw.upper().replace(" ", "")
+    if spec.startswith("TOP"):
+        n = spec[3:]
+        if not n.isdigit() or not 1 <= int(n) <= 100:
+            return None, "Формат: TOP30 (от TOP1 до TOP100)"
+        return spec, None
+    ex.load_markets()
+    tickers = [t for t in spec.split(",") if t]
+    missing = [t for t in tickers if f"{t}/USDT:USDT" not in ex.markets]
+    if not tickers or missing:
+        return None, f"Нет на Binance Futures: {', '.join(missing) or raw}"
+    return ",".join(tickers), None
+
+
 class Restart(Exception):
     """Перезапуск процесса (после /restart, /set, /update)."""
 
@@ -91,21 +143,23 @@ class Restart(Exception):
 class TradingBot:
     def __init__(self, cfg, ex, broker, tg):
         self.cfg, self.ex, self.broker, self.tg = cfg, ex, broker, tg
-        self.limit = min(max(500, cfg.strategy.warmup + 100), MAX_CANDLES)
+        self.tf_ms = ex.parse_timeframe(cfg.timeframe) * 1000
+        self.limit = min(cfg.strategy.warmup + 100, MAX_CANDLES)
         self.news_path = cfg.news_file if os.path.isabs(cfg.news_file) else os.path.join(ROOT, cfg.news_file)
         self.events = load_events(self.news_path)
         self.guard = RiskGuard(broker.equity(), cfg.target_profit_pct, cfg.max_drawdown_pct,
                                cfg.max_consecutive_losses, cfg.pause_hours)
+        self.symbols = []
+        self.symbols_day = None
         self.trading_enabled = True
         self.halted_reason = None  # причина остановки по лимитам риска
         self.last_candle_ts = None
         self.last_check_ms = None
-        self.last_price = None
+        self.last_scan = ""
         self.last_report_day = datetime.now(timezone.utc).date().isoformat()
         self.day_trades = []
-        self.open_trade = None  # (signal, amount, open_ms) для журнала
-        self.close_requested = False
-        self.manual_close = False  # на бирже ручное закрытие увидит следующий check_exit
+        self.close_requests = set()
+        self.manual_closes = set()  # на бирже ручное закрытие увидит следующий check_exits
         self.restored = False
 
     # --- Состояние -------------------------------------------------------------
@@ -113,24 +167,18 @@ class TradingBot:
     def to_state(self):
         g = self.guard
         return {
-            "mode": self.cfg.mode, "symbol": self.cfg.symbol, "timeframe": self.cfg.timeframe,
+            "version": STATE_VERSION, "mode": self.cfg.mode, "timeframe": self.cfg.timeframe,
             "guard": {"start_equity": g.start_equity, "consecutive_losses": g.consecutive_losses,
                       "paused_until_ms": g.paused_until_ms, "trades": g.trades},
             "trading_enabled": self.trading_enabled, "halted_reason": self.halted_reason,
             "last_candle_ts": self.last_candle_ts, "last_report_day": self.last_report_day,
-            "day_trades": self.day_trades,
-            "open_trade": None if not self.open_trade else {
-                "signal": asdict(self.open_trade[0]), "amount": self.open_trade[1],
-                "open_ms": self.open_trade[2]},
-            "broker": self.broker.to_state(),
+            "day_trades": self.day_trades, "broker": self.broker.to_state(),
         }
 
     def load(self, st):
         """Восстановить состояние после перезапуска (только для того же режима)."""
-        if not st or st.get("mode") != self.cfg.mode:
+        if not st or st.get("version") != STATE_VERSION or st.get("mode") != self.cfg.mode:
             return
-        same_symbol = st.get("symbol") == self.cfg.symbol
-        same_market = same_symbol and st.get("timeframe") == self.cfg.timeframe
         g = st["guard"]
         self.guard.start_equity = g["start_equity"]
         self.guard.consecutive_losses = g["consecutive_losses"]
@@ -140,12 +188,9 @@ class TradingBot:
         self.halted_reason = st["halted_reason"]
         self.last_report_day = st.get("last_report_day", self.last_report_day)
         self.day_trades = st.get("day_trades", [])
-        if same_market:
+        if st.get("timeframe") == self.cfg.timeframe:
             self.last_candle_ts = st.get("last_candle_ts")
-        if same_symbol and st.get("open_trade"):
-            t = st["open_trade"]
-            self.open_trade = (Signal(**t["signal"]), t["amount"], t["open_ms"])
-        self.broker.load_state(st["broker"], with_position=same_symbol)
+        self.broker.load_state(st["broker"])
         self.restored = True
 
     def save(self):
@@ -156,73 +201,122 @@ class TradingBot:
 
     # --- Торговля --------------------------------------------------------------
 
-    def tick(self):
-        cfg = self.cfg
-        candles = self.ex.fetch_ohlcv(cfg.symbol, cfg.timeframe, limit=self.limit)
-        closed, current = candles[:-1], candles[-1]
-        now_ms = self.ex.milliseconds()
-        self.last_price = current[4]
+    def refresh_symbols(self):
+        """Список монет; для TOP-N обновляется раз в сутки."""
+        today = datetime.now(timezone.utc).date().isoformat()
+        if self.symbols and self.symbols_day == today:
+            return
+        self.symbols = resolve_symbols(self.ex, self.cfg.symbols)
+        self.symbols_day = today
+        log.info("Монеты (%d): %s", len(self.symbols), ", ".join(short(s) for s in self.symbols))
 
-        if self.close_requested:
-            self.close_requested = False
-            pnl = self.broker.close_now(self.last_price)
+    def tick(self):
+        now_ms = self.ex.milliseconds()
+        for symbol in list(self.close_requests):
+            self.close_requests.discard(symbol)
+            if symbol not in self.broker.positions:
+                continue
+            pos = self.broker.positions[symbol]
+            price = self.ex.fetch_ticker(symbol)["last"]
+            pnl = self.broker.close(symbol, price)
             if pnl is not None:
-                self.on_closed(pnl, now_ms, manual=True)
+                self.on_closed(symbol, pos, pnl, now_ms, manual=True)
             else:
-                self.manual_close = True
-        pnl = self.broker.check_exit(current[2], current[3])
-        if pnl is not None:
-            self.on_closed(pnl, now_ms, manual=self.manual_close)
-            self.manual_close = False
+                self.manual_closes.add(symbol)
+        for symbol, pos, pnl in self.broker.check_exits(self.ex, self.cfg.timeframe):
+            manual = symbol in self.manual_closes
+            self.manual_closes.discard(symbol)
+            self.on_closed(symbol, pos, pnl, now_ms, manual)
 
         self.daily_report()
+        self.refresh_symbols()
 
-        if self.broker.in_position or closed[-1][0] == self.last_candle_ts:
+        closed_ts = now_ms // self.tf_ms * self.tf_ms - self.tf_ms  # последняя закрытая свеча
+        if closed_ts == self.last_candle_ts or now_ms - (closed_ts + self.tf_ms) < SCAN_DELAY_MS:
             return
-        self.last_candle_ts = closed[-1][0]
+        self.last_candle_ts = closed_ts
         self.last_check_ms = now_ms
         if not self.trading_enabled:
-            log.info("Торговля выключена, свеча %s пропущена", fmt_ts(closed[-1][0]))
+            log.info("Торговля выключена, свеча %s пропущена", fmt_ts(closed_ts))
             return
         if self.guard.is_paused(now_ms):
             log.info("Перерыв после серии убытков, новые сделки не открываются")
             return
         event = blocking_event(self.events, datetime.now(timezone.utc),
-                               cfg.news_hours_before, cfg.news_hours_after)
+                               self.cfg.news_hours_before, self.cfg.news_hours_after)
         if event:
             log.info("Рядом важное событие (%s), новые сделки не открываются", event)
             return
-        funding = current_funding(self.ex, cfg.symbol) if cfg.strategy.max_funding_pct > 0 else None
-        sig = generate_signal(closed, cfg.strategy, funding)
-        if not sig:
-            log.info("Свеча %s UTC закрыта по %.2f, funding %s: сигнала нет",
-                     fmt_ts(closed[-1][0]), closed[-1][4],
-                     "—" if funding is None else f"{funding * 100:.4f}%")
-            return
-        amount = position_size(self.broker.equity(), sig.entry, sig.stop,
-                               cfg.risk_per_trade_pct, cfg.leverage)
-        if self.broker.open(sig, amount) is not False:
-            self.open_trade = (sig, amount, now_ms)
-            self.tg.send(f"{'🟢 Лонг' if sig.side == 'long' else '🔴 Шорт'} {cfg.symbol}\n"
-                         f"Вход: {sig.entry:.6g}\nСтоп: {sig.stop:.6g}\n"
-                         f"Тейк: {sig.take:.6g}\nОбъём: {amount:.6g}")
+        self.scan(closed_ts, now_ms)
 
-    def on_closed(self, pnl, now_ms, manual=False):
+    def scan(self, closed_ts, now_ms):
+        """Проверить все монеты на закрытой свече и открыть позиции в пределах лимитов."""
+        cfg = self.cfg
+        signals, checked = [], 0
+        for symbol in self.symbols:  # порядок = приоритет (по ликвидности)
+            if symbol in self.broker.positions:
+                continue
+            try:
+                candles = [c for c in self.ex.fetch_ohlcv(symbol, cfg.timeframe, limit=self.limit)
+                           if c[0] <= closed_ts]
+            except Exception as e:
+                log.warning("%s: не удалось загрузить свечи: %s", symbol, e)
+                continue
+            if not candles or candles[-1][0] != closed_ts:
+                continue
+            checked += 1
+            sig = generate_signal(candles, cfg.strategy)
+            if sig:
+                signals.append((symbol, sig))
+
+        opened, skipped = [], []
+        max_funding = cfg.strategy.max_funding_pct / 100
+        for symbol, sig in signals:
+            if len(self.broker.positions) >= cfg.max_positions:
+                skipped.append(f"{short(symbol)} (лимит позиций)")
+                continue
+            if max_funding > 0:
+                f = current_funding(self.ex, symbol)
+                if f is not None and (f > max_funding if sig.side == "long" else f < -max_funding):
+                    skipped.append(f"{short(symbol)} (funding {f * 100:.3f}%)")
+                    continue
+            sized = portfolio_size(
+                self.broker.equity(), sig.entry, sig.stop, cfg.risk_per_trade_pct,
+                [(p["signal"].entry, p["amount"], p["risk"]) for p in self.broker.positions.values()],
+                cfg.max_total_risk_pct, cfg.leverage, min_notional(self.ex, symbol))
+            if not sized:
+                skipped.append(f"{short(symbol)} (лимит риска или мал объём)")
+                continue
+            amount, risk = sized
+            try:
+                ok = self.broker.open(symbol, sig, amount, risk, closed_ts, now_ms)
+            except Exception as e:
+                log.exception("%s: не удалось открыть позицию", symbol)
+                self.tg.error(f"{short(symbol)}: не удалось открыть позицию: {e}"[:500])
+                continue
+            if ok:
+                opened.append(symbol)
+                self.tg.send(f"{'🟢 Лонг' if sig.side == 'long' else '🔴 Шорт'} {short(symbol)}\n"
+                             f"Вход: {sig.entry:.6g}\nСтоп: {sig.stop:.6g}\nТейк: {sig.take:.6g}\n"
+                             f"Риск: {risk:.2f} USDT")
+        self.last_scan = (f"{fmt_ts(closed_ts)} UTC: проверено {checked} из {len(self.symbols)}, "
+                          f"сигналов {len(signals)}, открыто {len(opened)}")
+        log.info("Свеча %s", self.last_scan + (f"; пропущены: {', '.join(skipped)}" if skipped else ""))
+
+    def on_closed(self, symbol, pos, pnl, now_ms, manual=False):
         self.guard.record_trade(pnl, now_ms)
         self.day_trades.append(pnl)
         equity = self.broker.equity()
-        log.info("Сделка %+.4f USDT, депозит %.2f (%+.1f%% от старта)",
-                 pnl, equity, self.change_pct(equity))
-        if self.open_trade:
-            append_trade(JOURNAL_FILE, trade_row(self.cfg.symbol, *self.open_trade,
-                                                 now_ms, pnl, equity))
-            self.open_trade = None
+        log.info("%s: сделка %+.4f USDT, депозит %.2f (%+.1f%% от старта)",
+                 symbol, pnl, equity, self.change_pct(equity))
+        append_trade(JOURNAL_FILE, trade_row(symbol, pos["signal"], pos["amount"],
+                                             pos["open_ms"], now_ms, pnl, equity))
         how = "вручную" if manual else ("по тейку" if pnl >= 0 else "по стопу")
-        self.tg.send(f"{'✅' if pnl >= 0 else '❌'} Сделка закрыта {how}: {pnl:+.2f} USDT\n"
+        self.tg.send(f"{'✅' if pnl >= 0 else '❌'} {short(symbol)} закрыта {how}: {pnl:+.2f} USDT\n"
                      f"Депозит: {equity:.2f} USDT ({self.change_pct(equity):+.1f}% от старта)")
         if self.guard.is_paused(now_ms):
             log.warning("Серия убытков — перерыв %.0f ч", self.cfg.pause_hours)
-            self.tg.send(f"⏸ {self.cfg.max_consecutive_losses} убытка подряд — "
+            self.tg.send(f"⏸ {self.cfg.max_consecutive_losses} убытков подряд — "
                          f"перерыв {self.cfg.pause_hours:.0f} ч до "
                          f"{fmt_ts(self.guard.paused_until_ms)} UTC")
         reason = self.guard.stop_reason(equity)
@@ -230,7 +324,11 @@ class TradingBot:
             self.trading_enabled = False
             self.halted_reason = reason
             log.warning("Торговля остановлена: %s", reason)
-            self.tg.send(f"🛑 Торговля остановлена: {reason}\nДепозит: {equity:.2f} USDT\n"
+            extra = ""
+            if self.broker.positions:
+                extra = (f"\nОткрыто позиций: {len(self.broker.positions)} — они сохраняют стоп и тейк. "
+                         "/close all да — закрыть все.")
+            self.tg.send(f"🛑 Торговля остановлена: {reason}\nДепозит: {equity:.2f} USDT{extra}\n"
                          "Бот продолжает отвечать на команды. /resume — возобновить.")
 
     def change_pct(self, equity):
@@ -245,7 +343,7 @@ class TradingBot:
         self.tg.send(f"📊 Сводка за сутки\nСделок: {len(self.day_trades)}, "
                      f"результат {sum(self.day_trades):+.2f} USDT\n"
                      f"Депозит: {equity:.2f} USDT ({self.change_pct(equity):+.1f}% от старта)\n"
-                     f"Позиция: {'открыта' if self.broker.in_position else 'нет'}\n"
+                     f"Открыто позиций: {len(self.broker.positions)}\n"
                      f"Торговля: {self.trading_state()}")
         self.day_trades = []
 
@@ -262,6 +360,8 @@ class TradingBot:
 
     def handle(self, text):
         parts = text.split()
+        if not parts:
+            return
         cmd = parts[0].lower().lstrip("/").split("@")[0]
         args = parts[1:]
         handler = getattr(self, f"cmd_{cmd}", None)
@@ -285,29 +385,39 @@ class TradingBot:
 
     def cmd_status(self, args):
         cfg, equity = self.cfg, self.broker.equity()
-        lines = [f"🤖 {cfg.mode} | {cfg.symbol} {cfg.timeframe}",
+        positions = self.broker.positions
+        lines = [f"🤖 {cfg.mode} | {cfg.symbols} ({len(self.symbols)} монет) {cfg.timeframe}",
                  f"Торговля: {self.trading_state()}",
                  f"Депозит: {equity:.2f} USDT ({self.change_pct(equity):+.1f}% "
-                 f"от старта {self.guard.start_equity:.2f})"]
-        if self.broker.in_position and self.open_trade:
-            s, amount, opened = self.open_trade
-            upnl = self.broker.unrealized_pnl(self.last_price)
-            lines += [f"Позиция: {'🟢 лонг' if s.side == 'long' else '🔴 шорт'} {amount:.6g} "
-                      f"с {fmt_ts(opened)} UTC",
-                      f"Вход {s.entry:.6g}, стоп {s.stop:.6g}, тейк {s.take:.6g}",
-                      f"Цена {self.last_price:.6g}, PnL {upnl:+.2f} USDT"]
-        elif self.broker.in_position:
-            lines.append(f"Позиция открыта, PnL {self.broker.unrealized_pnl(self.last_price):+.2f} USDT")
-        else:
-            lines.append("Позиция: нет")
+                 f"от старта {self.guard.start_equity:.2f})",
+                 f"Риск {cfg.risk_per_trade_pct:g}% на сделку, цель "
+                 + (f"+{cfg.target_profit_pct:g}%" if cfg.target_profit_pct > 0 else "нет")
+                 + f", аварийная остановка -{cfg.max_drawdown_pct:g}%",
+                 f"Позиций: {len(positions)} из {cfg.max_positions}"]
+        total = 0.0
+        for symbol, p in positions.items():
+            s = p["signal"]
+            try:
+                upnl = self.broker.unrealized(symbol, self.ex.fetch_ticker(symbol)["last"])
+            except Exception:
+                upnl = 0.0
+            total += upnl
+            lines.append(f"{'🟢' if s.side == 'long' else '🔴'} {short(symbol)}: вход {s.entry:.6g}, "
+                         f"стоп {s.stop:.6g}, тейк {s.take:.6g}, PnL {upnl:+.2f}")
+        if positions:
+            lines.append(f"Нереализованный PnL: {total:+.2f} USDT")
         trades = self.guard.trades
         if trades:
             wins = sum(1 for t in trades if t > 0)
             lines.append(f"Сделок: {len(trades)}, прибыльных {wins} "
                          f"({wins / len(trades) * 100:.0f}%), итог {sum(trades):+.2f} USDT")
-        if self.last_check_ms:
-            lines.append(f"Последняя проверка сигнала: {fmt_ts(self.last_check_ms)} UTC")
+        if self.last_scan:
+            lines.append(f"Последняя проверка: {self.last_scan}")
         self.tg.send("\n".join(lines))
+
+    def cmd_coins(self, args):
+        self.tg.send(f"Монеты ({len(self.symbols)}), по убыванию ликвидности:\n"
+                     + ", ".join(short(s) for s in self.symbols))
 
     def cmd_trades(self, args):
         rows = []
@@ -323,7 +433,7 @@ class TradingBot:
                  f"итог {sum(pnls):+.2f} USDT", ""]
         for r in rows[-10:]:
             lines.append(f"{'✅' if float(r['pnl']) > 0 else '❌'} {r['close_time']} "
-                         f"{r['side']} {r['entry']} → {float(r['pnl']):+.2f}")
+                         f"{short(r['symbol'])} {r['side']} → {float(r['pnl']):+.2f}")
         self.tg.send("\n".join(lines))
 
     def cmd_journal(self, args):
@@ -334,8 +444,8 @@ class TradingBot:
 
     def cmd_pause(self, args):
         self.trading_enabled = False
-        self.tg.send("⏸ Новые сделки не открываются. Открытая позиция сохраняет стоп и тейк.\n"
-                     "/resume — возобновить, /close — закрыть позицию.")
+        self.tg.send("⏸ Новые сделки не открываются. Открытые позиции сохраняют стоп и тейк.\n"
+                     "/resume — возобновить, /close all да — закрыть все.")
 
     def cmd_resume(self, args):
         if self.halted_reason:
@@ -349,13 +459,25 @@ class TradingBot:
         self.tg.send("▶️ Торговля возобновлена.")
 
     def cmd_close(self, args):
-        if not self.broker.in_position:
-            self.tg.send("Открытой позиции нет.")
-        elif args[:1] in (["да"], ["yes"]):
-            self.close_requested = True
-            self.tg.send("Закрываю позицию по рынку…")
+        positions = self.broker.positions
+        if not positions:
+            self.tg.send("Открытых позиций нет.")
+            return
+        if len(args) != 2 or args[1].lower() not in ("да", "yes"):
+            self.tg.send("Открыты: " + ", ".join(short(s) for s in positions)
+                         + "\nЗакрыть одну: /close SOL да\nЗакрыть все: /close all да")
+            return
+        target = args[0].upper()
+        if target in ("ALL", "ВСЕ"):
+            symbols = list(positions)
         else:
-            self.tg.send("Закрыть позицию по рынку? Отправьте: /close да")
+            symbols = [s for s in positions if short(s) == target]
+            if not symbols:
+                self.tg.send(f"Позиции по {target} нет. Открыты: "
+                             + ", ".join(short(s) for s in positions))
+                return
+        self.close_requests.update(symbols)
+        self.tg.send(f"Закрываю по рынку: {', '.join(short(s) for s in symbols)}…")
 
     def cmd_settings(self, args):
         lines = ["Настройки (менять: /set КЛЮЧ ЗНАЧЕНИЕ):"]
@@ -364,46 +486,74 @@ class TradingBot:
             rng = f" [{lo}…{hi}]" if lo is not None else ""
             lines.append(f"{key} = {value}  — {desc}{rng}")
         lines.append(f"\nMODE = {self.cfg.mode} (меняется только на сервере)")
+        lines.append("Наборы: " + "; ".join(f"/preset {k} — {d}" for k, (d, _) in PRESETS.items()))
         self.tg.send("\n".join(lines))
 
+    def parse_setting(self, key, raw):
+        """(значение, None) или (None, текст ошибки)."""
+        typ, lo, hi, _ = SETTINGS[key]
+        if key == "SYMBOLS":
+            return validate_symbols_spec(self.ex, raw)
+        if key == "TIMEFRAME":
+            value = raw.lower()
+            if value not in TIMEFRAMES:
+                return None, f"Допустимые таймфреймы: {', '.join(TIMEFRAMES)}"
+            if self.broker.positions:
+                return None, "Таймфрейм можно менять только без открытых позиций."
+            return value, None
+        try:
+            value = typ(str(raw).replace(",", "."))
+        except ValueError:
+            return None, f"{raw} — не подходящее число для {key}."
+        if not lo <= value <= hi:
+            return None, f"{key} должен быть от {lo} до {hi}."
+        return value, None
+
     def cmd_set(self, args):
-        if len(args) != 2:
+        if len(args) < 2:
             self.tg.send("Формат: /set КЛЮЧ ЗНАЧЕНИЕ, например /set RISK_PER_TRADE_PCT 1.5\n"
                          "Список ключей: /settings")
             return
-        key, raw = args[0].upper(), args[1]
+        key = args[0].upper()
         if key not in SETTINGS:
             if key == "MODE" or key.startswith(("BINANCE", "TELEGRAM")):
                 self.tg.send("Эту настройку можно менять только на сервере.")
             else:
                 self.tg.send(f"Неизвестный ключ {key}. Список: /settings")
             return
-        typ, lo, hi, _ = SETTINGS[key]
-        if key == "SYMBOL":
-            value = raw.upper() if "/" in raw else f"{raw.upper()}/USDT:USDT"
-            self.ex.load_markets()
-            if value not in self.ex.markets:
-                self.tg.send(f"Монеты {value} нет на Binance Futures.")
-                return
-            if self.broker.in_position:
-                self.tg.send("Сначала дождитесь закрытия позиции или закройте её: /close")
-                return
-        elif key == "TIMEFRAME":
-            value = raw.lower()
-            if value not in TIMEFRAMES:
-                self.tg.send(f"Допустимые таймфреймы: {', '.join(TIMEFRAMES)}")
-                return
-        else:
-            try:
-                value = typ(raw.replace(",", "."))
-            except ValueError:
-                self.tg.send(f"{raw} — не подходящее число для {key}.")
-                return
-            if not lo <= value <= hi:
-                self.tg.send(f"{key} должен быть от {lo} до {hi}.")
-                return
+        value, error = self.parse_setting(key, " ".join(args[1:]))
+        if error:
+            self.tg.send(error)
+            return
         set_env_value(key, value, ENV_FILE)
         self.tg.send(f"✅ {key} = {value}. Перезапускаю бота…")
+        raise Restart
+
+    def cmd_preset(self, args):
+        name = args[0].lower() if args else ""
+        if name not in PRESETS:
+            self.tg.send("Наборы настроек:\n" + "\n".join(f"/preset {k} — {d}" for k, (d, _) in PRESETS.items()))
+            return
+        desc, values = PRESETS[name]
+        for key, value in values.items():
+            set_env_value(key, value, ENV_FILE)
+        self.tg.send(f"✅ Набор «{desc}» установлен:\n"
+                     + "\n".join(f"{k} = {v}" for k, v in values.items())
+                     + "\nПерезапускаю бота…")
+        raise Restart
+
+    def cmd_reset(self, args):
+        if self.cfg.mode != "paper":
+            self.tg.send("Сброс доступен только в режиме paper.")
+            return
+        if args[:1] not in (["да"], ["yes"]):
+            self.tg.send(f"Начать paper-торговлю заново с {self.cfg.paper_balance:g} USDT? "
+                         "Открытые бумажные позиции и счётчики риска будут сброшены, "
+                         "журнал сделок сохранится.\nПодтвердите: /reset да")
+            return
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+        self.tg.send("🔄 Paper-торговля начнётся заново. Перезапускаю бота…")
         raise Restart
 
     def cmd_news(self, args):
@@ -411,7 +561,7 @@ class TradingBot:
         if not self.events:
             self.tg.send("Событий нет. Добавить: /news_add 2026-11-12 13:30 CPI (время UTC)")
             return
-        lines = [f"Не торгую за {self.cfg.news_hours_before:.0f} ч до и "
+        lines = [f"Не открываю сделки за {self.cfg.news_hours_before:.0f} ч до и "
                  f"{self.cfg.news_hours_after:.0f} ч после события (время UTC):"]
         for i, (when, title) in enumerate(self.events, start=1):
             lines.append(f"{i}. {when:%Y-%m-%d %H:%M} {title}")
@@ -484,13 +634,20 @@ class TradingBot:
         cfg = self.cfg
         self.tg.set_commands(COMMANDS)
         self.tg.skip_pending()
+        try:
+            self.refresh_symbols()
+        except Exception as e:
+            log.warning("Не удалось получить список монет: %s", e)
         equity = self.broker.equity()
-        log.info("Старт: режим=%s, %s %s, депозит %.2f USDT, риск %.1f%%, событий: %d%s",
-                 cfg.mode, cfg.symbol, cfg.timeframe, equity, cfg.risk_per_trade_pct,
-                 len(self.events), ", состояние восстановлено" if self.restored else "")
-        self.tg.send(f"🚀 Бот запущен\nРежим: {cfg.mode}\n{cfg.symbol} {cfg.timeframe}\n"
-                     f"Депозит: {equity:.2f} USDT, риск {cfg.risk_per_trade_pct}% на сделку\n"
+        log.info("Старт: режим=%s, %s (%d монет) %s, депозит %.2f USDT, риск %.1f%%%s",
+                 cfg.mode, cfg.symbols, len(self.symbols), cfg.timeframe, equity,
+                 cfg.risk_per_trade_pct, ", состояние восстановлено" if self.restored else "")
+        self.tg.send(f"🚀 Бот запущен\nРежим: {cfg.mode}\n"
+                     f"Монеты: {cfg.symbols} ({len(self.symbols)} шт.), {cfg.timeframe}\n"
+                     f"Депозит: {equity:.2f} USDT, риск {cfg.risk_per_trade_pct:g}% на сделку, "
+                     f"до {cfg.max_positions} позиций\n"
                      f"Торговля: {self.trading_state()}"
+                     + (f"\nОткрыто позиций: {len(self.broker.positions)}" if self.broker.positions else "")
                      + ("\nСостояние восстановлено после перезапуска" if self.restored else "")
                      + "\n/help — команды")
         while True:
@@ -523,16 +680,23 @@ def main():
                          f"а Binance отдаёт {MAX_CANDLES}. Уменьшите TREND_EMA.")
     ex = make_exchange(cfg)
     if cfg.mode == "paper":
-        broker = PaperBroker(cfg.paper_balance)
+        broker = PaperPortfolio(cfg.paper_balance)
     else:
         if not cfg.api_key or not cfg.api_secret:
             raise SystemExit("Для режимов testnet/demo/live нужны BINANCE_API_KEY и BINANCE_API_SECRET")
         if cfg.mode == "live":
-            log.warning("РЕЖИМ LIVE: торговля реальными деньгами, плечо x%d", cfg.leverage)
-        broker = BinanceBroker(ex, cfg.symbol, cfg.leverage)
-    bot = TradingBot(cfg, ex, broker, Notifier(cfg.telegram_token, cfg.telegram_chat_id))
+            log.warning("РЕЖИМ LIVE: торговля реальными деньгами, плечо до x%d", cfg.leverage)
+        broker = BinancePortfolio(ex, cfg.leverage)
+    tg = Notifier(cfg.telegram_token, cfg.telegram_chat_id)
+    bot = TradingBot(cfg, ex, broker, tg)
     bot.load(load_state(STATE_FILE))
-    bot.run()
+    try:
+        bot.run()
+    except Exception as e:
+        # Падение — в лог и в Telegram; systemd перезапустит бота через 5 секунд
+        log.exception("Бот упал")
+        tg.send(f"💥 Бот упал: {type(e).__name__}: {e}"[:500] + "\nПерезапуск через несколько секунд.")
+        raise
 
 
 if __name__ == "__main__":

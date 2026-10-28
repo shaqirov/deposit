@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from .backtest import load_data
 from .broker import TAKER_FEE, make_exchange
 from .config import load_config
-from .risk import MARGIN_BUFFER
+from .risk import portfolio_size
 from .state import ROOT
 from .strategy import StrategyParams, generate_signals
 
@@ -156,19 +156,13 @@ def simulate(prepared, pp: PortfolioParams, start_ts=None, end_ts=None, stop_at_
                 break
             if symbol in positions:
                 continue
-            stop_dist = abs(sig.entry - sig.stop)
-            risk = balance * pp.risk_pct / 100
-            open_risk = sum(p["risk"] for p in positions.values())
-            if open_risk + risk > balance * pp.max_total_risk_pct / 100:
+            sized = portfolio_size(
+                balance, sig.entry, sig.stop, pp.risk_pct,
+                [(p["sig"].entry, p["amount"], p["risk"]) for p in positions.values()],
+                pp.max_total_risk_pct, pp.leverage, min_cost)
+            if not sized:
                 continue
-            amount = risk / stop_dist
-            used = sum(p["sig"].entry * p["amount"] for p in positions.values())
-            free = balance * pp.leverage * MARGIN_BUFFER - used
-            if amount * sig.entry > free:  # не хватает плеча — уменьшаем позицию
-                amount = max(free, 0) / sig.entry
-                risk = amount * stop_dist
-            if amount * sig.entry < min_cost:
-                continue
+            amount, risk = sized
             balance -= sig.entry * amount * TAKER_FEE
             positions[symbol] = {"sig": sig, "amount": amount, "risk": risk, "open_ts": ts}
 

@@ -24,8 +24,15 @@ def make_exchange(cfg):
     return ex
 
 
+def exit_price(signal, high, low):
+    """Цена выхода, если свеча задела стоп или тейк; если оба — консервативно стоп."""
+    if signal.side == "long":
+        return signal.stop if low <= signal.stop else signal.take if high >= signal.take else None
+    return signal.stop if high >= signal.stop else signal.take if low <= signal.take else None
+
+
 class PaperBroker:
-    """Симуляция на реальных котировках. Стоп/тейк проверяются по high/low свечи."""
+    """Одна позиция, симуляция по high/low свечей — для бэктеста."""
 
     def __init__(self, balance):
         self.balance = balance
@@ -33,10 +40,6 @@ class PaperBroker:
 
     def equity(self):
         return self.balance
-
-    @property
-    def in_position(self):
-        return self.position is not None
 
     def open(self, signal, amount):
         self.balance -= signal.entry * amount * TAKER_FEE
@@ -48,25 +51,8 @@ class PaperBroker:
         """Возвращает PnL закрытой сделки или None, если позиция ещё открыта."""
         if not self.position:
             return None
-        s, amount = self.position["signal"], self.position["amount"]
-        if s.side == "long":
-            # Если за свечу задеты оба уровня — считаем, что сработал стоп
-            exit_price = s.stop if low <= s.stop else s.take if high >= s.take else None
-        else:
-            exit_price = s.stop if high >= s.stop else s.take if low <= s.take else None
-        if exit_price is None:
-            return None
-        return self._close(exit_price)
-
-    def close_now(self, price):
-        """Закрыть позицию по рынку. Возвращает PnL."""
-        return self._close(price) if self.position else None
-
-    def unrealized_pnl(self, price):
-        if not self.position:
-            return 0.0
-        s, amount = self.position["signal"], self.position["amount"]
-        return (price - s.entry) * amount * (1 if s.side == "long" else -1)
+        price = exit_price(self.position["signal"], high, low)
+        return None if price is None else self._close(price)
 
     def _close(self, exit_price):
         s, amount = self.position["signal"], self.position["amount"]
@@ -79,109 +65,176 @@ class PaperBroker:
         log.info("[paper] закрыта по %.2f, PnL %.4f, баланс %.4f", exit_price, total, self.balance)
         return total
 
-    def to_state(self):
-        pos = self.position
-        return {"balance": self.balance,
-                "position": {"signal": asdict(pos["signal"]), "amount": pos["amount"]} if pos else None}
 
-    def load_state(self, state, with_position=True):
-        self.balance = state["balance"]
-        pos = state.get("position")
-        if pos and with_position:
-            self.position = {"signal": Signal(**pos["signal"]), "amount": pos["amount"]}
+class PaperPortfolio:
+    """Бумажная торговля несколькими монетами с общим депозитом."""
 
-
-class BinanceBroker:
-    """Реальные ордера: рыночный вход + стоп-лосс и тейк-профит с reduceOnly."""
-
-    def __init__(self, exchange, symbol, leverage):
-        self.ex = exchange
-        self.symbol = symbol
-        self.ex.load_markets()
-        self.ex.set_leverage(leverage, symbol)
-        try:
-            self.ex.set_margin_mode("isolated", symbol)
-        except ccxt.ExchangeError as e:  # уже isolated или есть открытые позиции
-            log.debug("set_margin_mode: %s", e)
-        self.in_position = self._has_position()
-        self.equity_before = self.equity()
+    def __init__(self, balance):
+        self.balance = balance
+        self.positions = {}  # symbol -> {signal, amount, risk, candle_ts, open_ms}
 
     def equity(self):
-        bal = self.ex.fetch_balance()
-        return float(bal["total"].get("USDT", 0))
+        return self.balance
 
-    def _position(self):
-        for p in self.ex.fetch_positions([self.symbol]):
-            if abs(float(p.get("contracts") or 0)) > 0:
-                return p
-        return None
+    def open(self, symbol, signal, amount, risk, candle_ts, now_ms):
+        self.balance -= signal.entry * amount * TAKER_FEE
+        self.positions[symbol] = {"signal": signal, "amount": amount, "risk": risk,
+                                  "candle_ts": candle_ts, "open_ms": now_ms}
+        log.info("[paper] %s: открыта %s %.6g @ %.6g, стоп %.6g, тейк %.6g", symbol,
+                 signal.side, amount, signal.entry, signal.stop, signal.take)
+        return True
 
-    def _has_position(self):
-        return self._position() is not None
+    def check_exits(self, ex, timeframe):
+        """Закрыть позиции, у которых свечи после входа задели стоп или тейк.
 
-    def unrealized_pnl(self, price=None):
-        p = self._position()
-        return float(p.get("unrealizedPnl") or 0) if p else 0.0
+        Возвращает [(symbol, позиция, pnl)]. Смотрим несколько последних свечей,
+        чтобы не пропустить экстремум свечи, закрывшейся между опросами.
+        """
+        closed = []
+        for symbol, pos in list(self.positions.items()):
+            for c in ex.fetch_ohlcv(symbol, timeframe, limit=3):
+                if c[0] <= pos["candle_ts"]:
+                    continue
+                price = exit_price(pos["signal"], c[2], c[3])
+                if price is not None:
+                    closed.append((symbol, pos, self._close(symbol, price)))
+                    break
+        return closed
 
-    def close_now(self, price=None):
-        """Закрыть позицию по рынку. PnL посчитает следующий check_exit."""
-        p = self._position()
-        if p:
-            side = "sell" if p.get("side") == "long" else "buy"
-            self.ex.create_order(self.symbol, "market", side, abs(float(p["contracts"])), None,
-                                 {"reduceOnly": True})
-            log.info("Позиция закрыта вручную по рынку")
-        self.cancel_all()
-        return None
+    def close(self, symbol, price):
+        """Закрыть по рынку. Возвращает PnL."""
+        return self._close(symbol, price)
+
+    def unrealized(self, symbol, price):
+        pos = self.positions[symbol]
+        s = pos["signal"]
+        return (price - s.entry) * pos["amount"] * (1 if s.side == "long" else -1)
+
+    def _close(self, symbol, price):
+        pos = self.positions.pop(symbol)
+        s, amount = pos["signal"], pos["amount"]
+        gross = (price - s.entry) * amount * (1 if s.side == "long" else -1)
+        exit_fee = price * amount * TAKER_FEE
+        self.balance += gross - exit_fee  # комиссия за вход списана при открытии
+        pnl = gross - exit_fee - s.entry * amount * TAKER_FEE
+        log.info("[paper] %s: закрыта по %.6g, PnL %.4f, баланс %.4f", symbol, price, pnl, self.balance)
+        return pnl
 
     def to_state(self):
-        return {"equity_before": self.equity_before}
+        return {"balance": self.balance, "positions": _positions_to_state(self.positions)}
 
-    def load_state(self, state, with_position=True):
-        if with_position and "equity_before" in state:
-            self.equity_before = state["equity_before"]
+    def load_state(self, state):
+        self.balance = state["balance"]
+        self.positions = _positions_from_state(state.get("positions", {}))
 
-    def open(self, signal, amount):
-        amount = float(self.ex.amount_to_precision(self.symbol, amount))
-        market = self.ex.market(self.symbol)
-        min_amount = (market.get("limits", {}).get("amount", {}) or {}).get("min") or 0
+
+class BinancePortfolio:
+    """Реальные ордера на нескольких монетах: рыночный вход + стоп и тейк с reduceOnly."""
+
+    def __init__(self, exchange, leverage):
+        self.ex = exchange
+        self.leverage = leverage
+        self.ex.load_markets()
+        self.positions = {}  # symbol -> {signal, amount, risk, candle_ts, open_ms}
+        self.prepared = set()
+
+    def equity(self):
+        return float(self.ex.fetch_balance()["total"].get("USDT", 0))
+
+    def _prepare(self, symbol):
+        if symbol in self.prepared:
+            return
+        self.ex.set_leverage(self.leverage, symbol)
+        try:
+            self.ex.set_margin_mode("isolated", symbol)
+        except ccxt.ExchangeError as e:  # уже isolated
+            log.debug("set_margin_mode %s: %s", symbol, e)
+        self.prepared.add(symbol)
+
+    def open(self, symbol, signal, amount, risk, candle_ts, now_ms):
+        amount = float(self.ex.amount_to_precision(symbol, amount))
+        min_amount = (self.ex.market(symbol).get("limits", {}).get("amount", {}) or {}).get("min") or 0
         if amount <= 0 or amount < min_amount:
-            log.warning("Объём %.8f меньше минимального %s — пропуск сигнала", amount, min_amount)
+            log.warning("%s: объём %.8f меньше минимального %s — пропуск", symbol, amount, min_amount)
             return False
+        self._prepare(symbol)
         side = "buy" if signal.side == "long" else "sell"
         close_side = "sell" if side == "buy" else "buy"
-        self.equity_before = self.equity()
-        order = self.ex.create_order(self.symbol, "market", side, amount)
-        log.info("Открыта %s %s: %s", signal.side, amount, order.get("id"))
-        stop = float(self.ex.price_to_precision(self.symbol, signal.stop))
-        take = float(self.ex.price_to_precision(self.symbol, signal.take))
+        order = self.ex.create_order(symbol, "market", side, amount)
+        log.info("%s: открыта %s %s, ордер %s", symbol, signal.side, amount, order.get("id"))
+        self.positions[symbol] = {"signal": signal, "amount": amount, "risk": risk,
+                                  "candle_ts": candle_ts, "open_ms": now_ms}
+        stop = float(self.ex.price_to_precision(symbol, signal.stop))
+        take = float(self.ex.price_to_precision(symbol, signal.take))
         try:
-            self.ex.create_order(self.symbol, "market", close_side, amount, None,
+            self.ex.create_order(symbol, "market", close_side, amount, None,
                                  {"stopLossPrice": stop, "reduceOnly": True})
-            self.ex.create_order(self.symbol, "market", close_side, amount, None,
+            self.ex.create_order(symbol, "market", close_side, amount, None,
                                  {"takeProfitPrice": take, "reduceOnly": True})
         except Exception:
             # Без защитного стопа позицию держать нельзя — закрываем сразу
-            log.exception("Не удалось выставить стоп/тейк, закрываю позицию")
-            self.ex.create_order(self.symbol, "market", close_side, amount, None,
-                                 {"reduceOnly": True})
+            log.exception("%s: не удалось выставить стоп/тейк, закрываю позицию", symbol)
+            self.ex.create_order(symbol, "market", close_side, amount, None, {"reduceOnly": True})
             raise
-        self.in_position = True
         return True
 
-    def check_exit(self, high=None, low=None):
-        """Возвращает PnL, если позиция закрылась (сработал стоп или тейк)."""
-        if not self.in_position or self._has_position():
-            return None
-        self.in_position = False
-        self.cancel_all()
-        pnl = self.equity() - self.equity_before
-        log.info("Позиция закрыта, PnL %.4f USDT", pnl)
-        return pnl
+    def _live(self):
+        """Открытые на бирже позиции по нашим монетам: symbol -> позиция ccxt."""
+        if not self.positions:
+            return {}
+        return {p["symbol"]: p for p in self.ex.fetch_positions(list(self.positions))
+                if abs(float(p.get("contracts") or 0)) > 0}
 
-    def cancel_all(self):
+    def check_exits(self, ex=None, timeframe=None):
+        """Позиции, которые биржа закрыла (стоп, тейк или вручную): [(symbol, позиция, pnl)]."""
+        live = self._live()
+        closed = []
+        for symbol in [s for s in self.positions if s not in live]:
+            pos = self.positions.pop(symbol)
+            self.cancel_all(symbol)
+            pnl = self._realized_pnl(symbol, pos["open_ms"])
+            log.info("%s: позиция закрыта, PnL %.4f USDT", symbol, pnl)
+            closed.append((symbol, pos, pnl))
+        return closed
+
+    def _realized_pnl(self, symbol, since_ms):
+        """PnL по сделкам биржи с момента входа: реализованный результат минус комиссии."""
+        trades = self.ex.fetch_my_trades(symbol, since=since_ms - 60_000)
+        pnl = sum(float((t.get("info") or {}).get("realizedPnl") or 0) for t in trades)
+        fees = sum(float((t.get("fee") or {}).get("cost") or 0) for t in trades)
+        return pnl - fees
+
+    def close(self, symbol, price=None):
+        """Закрыть по рынку. PnL посчитает следующий check_exits."""
+        p = self._live().get(symbol)
+        if p:
+            side = "sell" if p.get("side") == "long" else "buy"
+            self.ex.create_order(symbol, "market", side, abs(float(p["contracts"])), None,
+                                 {"reduceOnly": True})
+            log.info("%s: позиция закрыта вручную по рынку", symbol)
+        return None
+
+    def unrealized(self, symbol, price=None):
+        p = self._live().get(symbol)
+        return float(p.get("unrealizedPnl") or 0) if p else 0.0
+
+    def cancel_all(self, symbol):
         for params in ({}, {"trigger": True}):
             try:
-                self.ex.cancel_all_orders(self.symbol, params)
+                self.ex.cancel_all_orders(symbol, params)
             except ccxt.ExchangeError as e:
-                log.debug("cancel_all_orders %s: %s", params, e)
+                log.debug("cancel_all_orders %s %s: %s", symbol, params, e)
+
+    def to_state(self):
+        return {"positions": _positions_to_state(self.positions)}
+
+    def load_state(self, state):
+        self.positions = _positions_from_state(state.get("positions", {}))
+
+
+def _positions_to_state(positions):
+    return {s: {**p, "signal": asdict(p["signal"])} for s, p in positions.items()}
+
+
+def _positions_from_state(data):
+    return {s: {**p, "signal": Signal(**p["signal"])} for s, p in data.items()}

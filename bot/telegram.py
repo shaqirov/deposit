@@ -123,12 +123,15 @@ class Notifier:
             result = call(self.token, "getUpdates",
                           {"offset": self.offset, "timeout": timeout, "allowed_updates": ["message"]},
                           timeout=timeout + 10).get("result", [])
+        except TimeoutError:
+            # Telegram не ответил на долгий опрос вовремя — обычное дело, просто повторяем
+            return []
         except Exception as e:
             now = time.time()
             if now - self.last_poll_error_s >= ERROR_INTERVAL_S:
                 self.last_poll_error_s = now
                 log.warning("Telegram: не удалось получить команды: %s", e)
-            time.sleep(timeout)
+            time.sleep(min(timeout, 5))
             return []
         texts = []
         for update in result:

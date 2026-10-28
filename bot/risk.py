@@ -20,6 +20,31 @@ def position_size(equity, entry, stop, risk_pct, leverage):
     return min(by_risk, by_margin)
 
 
+def portfolio_size(balance, entry, stop, risk_pct, open_positions, max_total_risk_pct,
+                   leverage, min_cost):
+    """Размер новой позиции в портфеле: (amount, risk_usdt) или None, если входить нельзя.
+
+    open_positions — список (entry, amount, risk_usdt) уже открытых позиций.
+    Суммарный риск открытых позиций не превышает max_total_risk_pct депозита,
+    общий объём — депозит * плечо. Если плеча не хватает, позиция уменьшается;
+    если объём меньше минимального ордера биржи — None.
+    """
+    stop_dist = abs(entry - stop)
+    if stop_dist <= 0 or balance <= 0 or entry <= 0:
+        return None
+    risk = balance * risk_pct / 100
+    if sum(r for _, _, r in open_positions) + risk > balance * max_total_risk_pct / 100:
+        return None
+    amount = risk / stop_dist
+    free = balance * leverage * MARGIN_BUFFER - sum(e * a for e, a, _ in open_positions)
+    if amount * entry > free:
+        amount = max(free, 0) / entry
+        risk = amount * stop_dist
+    if amount <= 0 or amount * entry < min_cost:
+        return None
+    return amount, risk
+
+
 @dataclass
 class RiskGuard:
     start_equity: float
@@ -45,7 +70,7 @@ class RiskGuard:
     def stop_reason(self, equity):
         """Причина остановки или None, если торговлю можно продолжать."""
         change_pct = (equity - self.start_equity) / self.start_equity * 100
-        if change_pct >= self.target_profit_pct:
+        if self.target_profit_pct > 0 and change_pct >= self.target_profit_pct:
             return f"цель достигнута: +{change_pct:.1f}%"
         if change_pct <= -self.max_drawdown_pct:
             return f"превышена просадка: {change_pct:.1f}%"

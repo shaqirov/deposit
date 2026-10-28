@@ -86,6 +86,8 @@ def run_backtest(candles, cfg, stop_on_guard=True, funding=None, journal=None):
                     stop_reason = guard.stop_reason(eq)
                     if stop_reason:
                         break
+        # Как в живом боте: после выхода внутри свечи на её закрытии можно войти снова
+        if broker.position:
             continue
         sig = signals[i]
         if sig and not guard.is_paused(c[0]):

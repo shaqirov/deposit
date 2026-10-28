@@ -10,3 +10,4 @@ state.json.tmp
 bot.log*
 .cache/
 .venv/
+cache/

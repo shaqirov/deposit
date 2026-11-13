@@ -76,10 +76,10 @@ class PaperPortfolio:
     def equity(self):
         return self.balance
 
-    def open(self, symbol, signal, amount, risk, candle_ts, now_ms):
+    def open(self, symbol, signal, amount, risk, candle_ts, now_ms, leverage=1):
         self.balance -= signal.entry * amount * TAKER_FEE
         self.positions[symbol] = {"signal": signal, "amount": amount, "risk": risk,
-                                  "candle_ts": candle_ts, "open_ms": now_ms}
+                                  "candle_ts": candle_ts, "open_ms": now_ms, "leverage": leverage}
         log.info("[paper] %s: открыта %s %.6g @ %.6g, стоп %.6g, тейк %.6g", symbol,
                  signal.side, amount, signal.entry, signal.stop, signal.take)
         return True
@@ -131,39 +131,43 @@ class PaperPortfolio:
 class BinancePortfolio:
     """Реальные ордера на нескольких монетах: рыночный вход + стоп и тейк с reduceOnly."""
 
-    def __init__(self, exchange, leverage):
+    def __init__(self, exchange):
         self.ex = exchange
-        self.leverage = leverage
         self.ex.load_markets()
-        self.positions = {}  # symbol -> {signal, amount, risk, candle_ts, open_ms}
-        self.prepared = set()
+        self.positions = {}  # symbol -> {signal, amount, risk, candle_ts, open_ms, leverage}
+        self.margin_set = set()
+        self.leverage = {}  # последнее выставленное плечо по монете
 
     def equity(self):
         return float(self.ex.fetch_balance()["total"].get("USDT", 0))
 
-    def _prepare(self, symbol):
-        if symbol in self.prepared:
-            return
-        self.ex.set_leverage(self.leverage, symbol)
-        try:
-            self.ex.set_margin_mode("isolated", symbol)
-        except ccxt.ExchangeError as e:  # уже isolated
-            log.debug("set_margin_mode %s: %s", symbol, e)
-        self.prepared.add(symbol)
+    def _prepare(self, symbol, leverage):
+        if symbol not in self.margin_set:
+            try:
+                self.ex.set_margin_mode("isolated", symbol)
+            except ccxt.ExchangeError as e:  # уже isolated
+                log.debug("set_margin_mode %s: %s", symbol, e)
+            self.margin_set.add(symbol)
+        if self.leverage.get(symbol) != leverage:
+            self.ex.set_leverage(leverage, symbol)
+            self.leverage[symbol] = leverage
 
-    def open(self, symbol, signal, amount, risk, candle_ts, now_ms):
+    def open(self, symbol, signal, amount, risk, candle_ts, now_ms, leverage=1):
         amount = float(self.ex.amount_to_precision(symbol, amount))
         min_amount = (self.ex.market(symbol).get("limits", {}).get("amount", {}) or {}).get("min") or 0
         if amount <= 0 or amount < min_amount:
             log.warning("%s: объём %.8f меньше минимального %s — пропуск", symbol, amount, min_amount)
             return False
-        self._prepare(symbol)
+        self._prepare(symbol, leverage)
         side = "buy" if signal.side == "long" else "sell"
         close_side = "sell" if side == "buy" else "buy"
         order = self.ex.create_order(symbol, "market", side, amount)
-        log.info("%s: открыта %s %s, ордер %s", symbol, signal.side, amount, order.get("id"))
-        self.positions[symbol] = {"signal": signal, "amount": amount, "risk": risk,
-                                  "candle_ts": candle_ts, "open_ms": now_ms}
+        filled = float(order.get("average") or 0) or signal.entry
+        log.info("%s: открыта %s %s по %s, плечо x%s, ордер %s", symbol, signal.side, amount,
+                 filled, leverage, order.get("id"))
+        self.positions[symbol] = {"signal": Signal(signal.side, filled, signal.stop, signal.take),
+                                  "amount": amount, "risk": risk, "candle_ts": candle_ts,
+                                  "open_ms": now_ms, "leverage": leverage}
         stop = float(self.ex.price_to_precision(symbol, signal.stop))
         take = float(self.ex.price_to_precision(symbol, signal.take))
         try:

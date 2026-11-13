@@ -342,3 +342,19 @@ def test_notifier_poll_timeout_returns_immediately(monkeypatch):
     monkeypatch.setattr(tgmod, "call", slow)
     monkeypatch.setattr(tgmod.time, "sleep", lambda s: pytest.fail("не должен ждать"))
     assert tgmod.Notifier("token", 42).poll(10) == []
+
+
+def test_entry_uses_current_price_and_skips_runaway(files):
+    ex = FakeEx()
+    bot = make_bot(files, ex=ex)
+    sig_close = ex.closed["A/USDT:USDT"][-1][4]
+    ex.current["A/USDT:USDT"][4] = sig_close * 1.001  # чуть выше закрытия — входим по ней
+    ex.current["B/USDT:USDT"][4] = 54.5  # B почти дошла до тейка — вход невыгоден
+    bot.tick()
+    assert list(bot.broker.positions) == ["A/USDT:USDT"]
+    pos = bot.broker.positions["A/USDT:USDT"]
+    assert pos["signal"].entry == sig_close * 1.001
+    # риск по-прежнему 2% депозита от фактической цены входа
+    assert abs(pos["amount"] * (pos["signal"].entry - pos["signal"].stop) - pos["risk"]) < 1e-9
+    assert abs(pos["risk"] - 2) < 0.01
+    assert any("плечо x" in t for t in bot.tg.sent)

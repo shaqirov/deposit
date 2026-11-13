@@ -176,3 +176,25 @@ def test_telegram_failure_does_not_raise(monkeypatch):
         raise OSError("network down")
     monkeypatch.setattr(tgmod, "call", broken)
     tgmod.Notifier("token", "42").send("hello")
+
+
+def test_position_leverage_keeps_liquidation_beyond_stop():
+    from bot.risk import position_leverage
+    assert position_leverage(100, 98, 10) == 10       # стоп 2% — максимальное плечо
+    assert position_leverage(100, 116, 10) == 4       # стоп 16% (как у BULLA) — плечо 4
+    assert position_leverage(100, 40, 10) == 1
+    for stop_pct in (0.01, 0.05, 0.1, 0.16, 0.3):
+        lev = position_leverage(100, 100 * (1 - stop_pct), 10)
+        assert 1 / lev > stop_pct * 1.4  # ликвидация (~1/плечо) заметно дальше стопа
+
+
+def test_portfolio_size_limits_total_margin():
+    from bot.risk import portfolio_size
+    # стоп 16%: плечо 4, позиция на риск 2 USDT = 12.5 USDT объёма, маржа 3.1
+    amount, risk, lev = portfolio_size(100, 100, 116, 2, [], 100, 10, 5)
+    assert lev == 4 and abs(risk - 2) < 1e-9
+    # маржа уже почти вся занята — позицию урезает до свободной маржи
+    busy = [(100, 9.3, 1.0, 98)]  # объём 930 при плече 10 = маржа 93
+    amount, risk, lev = portfolio_size(100, 100, 116, 2, busy, 100, 10, 1)
+    assert abs(amount * 100 / lev - 2) < 1e-6  # свободно 95 - 93 = 2, а нужно 3.1
+    assert risk < 2

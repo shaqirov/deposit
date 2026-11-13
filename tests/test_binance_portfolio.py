@@ -11,6 +11,7 @@ class FakeCcxt:
         self.open_positions = {}  # symbol -> contracts (со знаком)
         self.fail_stop = fail_stop
         self.trades = {}
+        self.fill_price = None
 
     def load_markets(self):
         return {}
@@ -43,7 +44,7 @@ class FakeCcxt:
             self.open_positions[symbol] = self.open_positions.get(symbol, 0) + delta
             if abs(self.open_positions[symbol]) < 1e-12:
                 del self.open_positions[symbol]
-        return {"id": str(len(self.orders))}
+        return {"id": str(len(self.orders)), "average": self.fill_price}
 
     def fetch_positions(self, symbols):
         return [{"symbol": s, "contracts": abs(c), "side": "long" if c > 0 else "short",
@@ -61,19 +62,22 @@ SIG = Signal("long", 100.0, 95.0, 110.0)
 
 def test_open_places_entry_stop_and_take():
     ex = FakeCcxt()
-    b = BinancePortfolio(ex, leverage=10)
-    assert b.open("SOL/USDT:USDT", SIG, 0.4, 2.0, 0, 1000)
+    b = BinancePortfolio(ex)
+    ex.fill_price = 100.3
+    assert b.open("SOL/USDT:USDT", SIG, 0.4, 2.0, 0, 1000, leverage=7)
     entry, stop, take = ex.orders
     assert entry[:3] == ("SOL/USDT:USDT", "buy", 0.4) and not entry[3]
     assert stop[1] == "sell" and stop[3] == {"stopLossPrice": 95.0, "reduceOnly": True}
     assert take[1] == "sell" and take[3] == {"takeProfitPrice": 110.0, "reduceOnly": True}
-    assert ex.leverage["SOL/USDT:USDT"] == 10
+    assert ex.leverage["SOL/USDT:USDT"] == 7
+    # в позиции — фактическая цена исполнения, стоп и тейк прежние
+    assert b.positions["SOL/USDT:USDT"]["signal"] == Signal("long", 100.3, 95.0, 110.0)
     assert b.unrealized("SOL/USDT:USDT") == 1.5
 
 
 def test_failed_stop_closes_position_immediately():
     ex = FakeCcxt(fail_stop=True)
-    b = BinancePortfolio(ex, leverage=10)
+    b = BinancePortfolio(ex)
     with pytest.raises(RuntimeError):
         b.open("SOL/USDT:USDT", SIG, 0.4, 2.0, 0, 1000)
     assert ex.open_positions == {}  # позиция без стопа закрыта по рынку
@@ -82,13 +86,13 @@ def test_failed_stop_closes_position_immediately():
 
 def test_too_small_amount_is_skipped():
     ex = FakeCcxt()
-    assert BinancePortfolio(ex, 10).open("SOL/USDT:USDT", SIG, 0.0001, 0.1, 0, 1000) is False
+    assert BinancePortfolio(ex).open("SOL/USDT:USDT", SIG, 0.0001, 0.1, 0, 1000) is False
     assert ex.orders == []
 
 
 def test_exit_detected_with_realized_pnl_and_orders_cancelled():
     ex = FakeCcxt()
-    b = BinancePortfolio(ex, leverage=10)
+    b = BinancePortfolio(ex)
     b.open("SOL/USDT:USDT", SIG, 0.4, 2.0, 0, 1000)
     b.open("ETH/USDT:USDT", Signal("short", 100.0, 105.0, 90.0), 0.4, 2.0, 0, 1000)
     assert b.check_exits() == []
@@ -106,11 +110,25 @@ def test_exit_detected_with_realized_pnl_and_orders_cancelled():
 
 def test_manual_close_and_state_roundtrip():
     ex = FakeCcxt()
-    b = BinancePortfolio(ex, leverage=10)
+    b = BinancePortfolio(ex)
     b.open("ETH/USDT:USDT", Signal("short", 100.0, 105.0, 90.0), 0.4, 2.0, 0, 1000)
-    restored = BinancePortfolio(ex, leverage=10)
+    restored = BinancePortfolio(ex)
     restored.load_state(b.to_state())
     assert restored.positions["ETH/USDT:USDT"]["signal"].side == "short"
     assert restored.close("ETH/USDT:USDT") is None
     assert ex.orders[-1][:2] == ("ETH/USDT:USDT", "buy") and ex.orders[-1][3] == {"reduceOnly": True}
     assert [s for s, _, _ in restored.check_exits()] == ["ETH/USDT:USDT"]
+
+
+def test_leverage_is_set_per_trade_only_when_it_changes():
+    ex = FakeCcxt()
+    calls = []
+    ex.set_leverage = lambda lev, symbol: calls.append((symbol, lev))
+    b = BinancePortfolio(ex)
+    b.open("SOL/USDT:USDT", SIG, 0.4, 2.0, 0, 1000, leverage=5)
+    ex.open_positions.clear()
+    b.positions.clear()
+    b.open("SOL/USDT:USDT", SIG, 0.4, 2.0, 0, 2000, leverage=5)
+    b.positions.clear()
+    b.open("SOL/USDT:USDT", SIG, 0.4, 2.0, 0, 3000, leverage=3)
+    assert calls == [("SOL/USDT:USDT", 5), ("SOL/USDT:USDT", 3)]

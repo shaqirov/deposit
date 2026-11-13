@@ -38,7 +38,7 @@ class PortfolioParams:
     risk_pct: float = 2.0            # риск на сделку, % от депозита
     max_positions: int = 6           # одновременно открытых позиций
     max_total_risk_pct: float = 20.0  # суммарный риск открытых позиций, %
-    leverage: float = 10.0           # общий объём позиций не больше депозит * плечо
+    leverage: float = 10.0           # максимальное плечо; у волатильных монет — меньше
     target_pct: float = 100.0        # цель (x2 = 100%)
     ruin_pct: float = 50.0           # аварийная остановка при просадке от старта
     start_balance: float = 100.0
@@ -158,11 +158,11 @@ def simulate(prepared, pp: PortfolioParams, start_ts=None, end_ts=None, stop_at_
                 continue
             sized = portfolio_size(
                 balance, sig.entry, sig.stop, pp.risk_pct,
-                [(p["sig"].entry, p["amount"], p["risk"]) for p in positions.values()],
+                [(p["sig"].entry, p["amount"], p["risk"], p["sig"].stop) for p in positions.values()],
                 pp.max_total_risk_pct, pp.leverage, min_cost)
             if not sized:
                 continue
-            amount, risk = sized
+            amount, risk, _ = sized
             balance -= sig.entry * amount * TAKER_FEE
             positions[symbol] = {"sig": sig, "amount": amount, "risk": risk, "open_ts": ts}
 

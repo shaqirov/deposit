@@ -17,13 +17,14 @@ from .news import add_event, blocking_event, load_events, remove_event
 from .portfolio import min_notional, top_symbols
 from .risk import RiskGuard, portfolio_size
 from .state import ENV_FILE, ROOT, STATE_FILE, load_state, save_state, set_env_value
-from .strategy import generate_signal
+from .strategy import Signal, generate_signal
 from .telegram import Notifier
 
 log = logging.getLogger("bot")
 POLL_SECONDS = 10
 MAX_CANDLES = 1500   # больше Binance не отдаёт за один запрос
 SCAN_DELAY_MS = 15_000  # ждём после закрытия свечи, пока биржа её сформирует
+MIN_RR_AT_ENTRY = 1.5   # не входить, если по текущей цене тейк меньше 1.5 стопа
 JOURNAL_FILE = os.path.join(ROOT, "journal.csv")
 LOG_FILE = os.path.join(ROOT, "bot.log")
 RESTART_EXIT_CODE = 3  # systemd перезапускает бота при ненулевом коде выхода
@@ -280,25 +281,39 @@ class TradingBot:
                 if f is not None and (f > max_funding if sig.side == "long" else f < -max_funding):
                     skipped.append(f"{short(symbol)} (funding {f * 100:.3f}%)")
                     continue
+            # Вход по текущей цене, а не по закрытию свечи: размер считаем от неё,
+            # чтобы риск остался заданным; если цена ушла к тейку — вход уже невыгоден
+            try:
+                price = self.ex.fetch_ticker(symbol)["last"]
+            except Exception as e:
+                log.warning("%s: не удалось получить цену: %s", symbol, e)
+                continue
+            inside = sig.stop < price < sig.take if sig.side == "long" else sig.take < price < sig.stop
+            if not inside or abs(sig.take - price) < abs(price - sig.stop) * MIN_RR_AT_ENTRY:
+                skipped.append(f"{short(symbol)} (цена ушла: {price:.6g})")
+                continue
+            entry_sig = Signal(sig.side, price, sig.stop, sig.take)
             sized = portfolio_size(
-                self.broker.equity(), sig.entry, sig.stop, cfg.risk_per_trade_pct,
-                [(p["signal"].entry, p["amount"], p["risk"]) for p in self.broker.positions.values()],
+                self.broker.equity(), price, sig.stop, cfg.risk_per_trade_pct,
+                [(p["signal"].entry, p["amount"], p["risk"], p["signal"].stop)
+                 for p in self.broker.positions.values()],
                 cfg.max_total_risk_pct, cfg.leverage, min_notional(self.ex, symbol))
             if not sized:
                 skipped.append(f"{short(symbol)} (лимит риска или мал объём)")
                 continue
-            amount, risk = sized
+            amount, risk, leverage = sized
             try:
-                ok = self.broker.open(symbol, sig, amount, risk, closed_ts, now_ms)
+                ok = self.broker.open(symbol, entry_sig, amount, risk, closed_ts, now_ms, leverage)
             except Exception as e:
                 log.exception("%s: не удалось открыть позицию", symbol)
                 self.tg.error(f"{short(symbol)}: не удалось открыть позицию: {e}"[:500])
                 continue
             if ok:
                 opened.append(symbol)
+                filled = self.broker.positions[symbol]["signal"]  # с фактической ценой исполнения
                 self.tg.send(f"{'🟢 Лонг' if sig.side == 'long' else '🔴 Шорт'} {short(symbol)}\n"
-                             f"Вход: {sig.entry:.6g}\nСтоп: {sig.stop:.6g}\nТейк: {sig.take:.6g}\n"
-                             f"Риск: {risk:.2f} USDT")
+                             f"Вход: {filled.entry:.6g}\nСтоп: {sig.stop:.6g}\nТейк: {sig.take:.6g}\n"
+                             f"Риск: {risk:.2f} USDT, плечо x{leverage}")
         self.last_scan = (f"{fmt_ts(closed_ts)} UTC: проверено {checked} из {len(self.symbols)}, "
                           f"сигналов {len(signals)}, открыто {len(opened)}")
         log.info("Свеча %s", self.last_scan + (f"; пропущены: {', '.join(skipped)}" if skipped else ""))
@@ -686,7 +701,7 @@ def main():
             raise SystemExit("Для режимов testnet/demo/live нужны BINANCE_API_KEY и BINANCE_API_SECRET")
         if cfg.mode == "live":
             log.warning("РЕЖИМ LIVE: торговля реальными деньгами, плечо до x%d", cfg.leverage)
-        broker = BinancePortfolio(ex, cfg.leverage)
+        broker = BinancePortfolio(ex)
     tg = Notifier(cfg.telegram_token, cfg.telegram_chat_id)
     bot = TradingBot(cfg, ex, broker, tg)
     bot.load(load_state(STATE_FILE))

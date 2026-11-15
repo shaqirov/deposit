@@ -25,7 +25,7 @@ POLL_SECONDS = 10
 MAX_CANDLES = 1500   # больше Binance не отдаёт за один запрос
 SCAN_DELAY_MS = 15_000  # ждём после закрытия свечи, пока биржа её сформирует
 MIN_RR_AT_ENTRY = 1.5   # не входить, если по текущей цене тейк меньше 1.5 стопа
-JOURNAL_FILE = os.path.join(ROOT, "journal.csv")
+JOURNAL_DIR = ROOT  # журнал свой для каждого режима: journal_paper.csv, journal_live.csv…
 LOG_FILE = os.path.join(ROOT, "bot.log")
 RESTART_EXIT_CODE = 3  # systemd перезапускает бота при ненулевом коде выхода
 STATE_VERSION = 2
@@ -148,6 +148,7 @@ class TradingBot:
         self.limit = min(cfg.strategy.warmup + 100, MAX_CANDLES)
         self.news_path = cfg.news_file if os.path.isabs(cfg.news_file) else os.path.join(ROOT, cfg.news_file)
         self.events = load_events(self.news_path)
+        self.journal = os.path.join(JOURNAL_DIR, f"journal_{cfg.mode}.csv")
         self.guard = RiskGuard(broker.equity(), cfg.target_profit_pct, cfg.max_drawdown_pct,
                                cfg.max_consecutive_losses, cfg.pause_hours)
         self.symbols = []
@@ -324,7 +325,7 @@ class TradingBot:
         equity = self.broker.equity()
         log.info("%s: сделка %+.4f USDT, депозит %.2f (%+.1f%% от старта)",
                  symbol, pnl, equity, self.change_pct(equity))
-        append_trade(JOURNAL_FILE, trade_row(symbol, pos["signal"], pos["amount"],
+        append_trade(self.journal, trade_row(symbol, pos["signal"], pos["amount"],
                                              pos["open_ms"], now_ms, pnl, equity))
         how = "вручную" if manual else ("по тейку" if pnl >= 0 else "по стопу")
         self.tg.send(f"{'✅' if pnl >= 0 else '❌'} {short(symbol)} закрыта {how}: {pnl:+.2f} USDT\n"
@@ -436,8 +437,8 @@ class TradingBot:
 
     def cmd_trades(self, args):
         rows = []
-        if os.path.exists(JOURNAL_FILE):
-            with open(JOURNAL_FILE, encoding="utf-8") as f:
+        if os.path.exists(self.journal):
+            with open(self.journal, encoding="utf-8") as f:
                 rows = list(csv.DictReader(f))
         if not rows:
             self.tg.send("Сделок пока не было.")
@@ -452,8 +453,8 @@ class TradingBot:
         self.tg.send("\n".join(lines))
 
     def cmd_journal(self, args):
-        if os.path.exists(JOURNAL_FILE):
-            self.tg.send_document(JOURNAL_FILE, "Журнал сделок")
+        if os.path.exists(self.journal):
+            self.tg.send_document(self.journal, f"Журнал сделок ({self.cfg.mode})")
         else:
             self.tg.send("Сделок пока не было.")
 

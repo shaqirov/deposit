@@ -4,7 +4,7 @@ __pycache__/
 .pytest_cache/
 state.json
 *.log
-journal.csv
+journal*.csv
 trades.csv
 state.json.tmp
 bot.log*

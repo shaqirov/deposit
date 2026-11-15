@@ -98,8 +98,9 @@ class FakeTg:
 
 @pytest.fixture
 def files(tmp_path, monkeypatch):
-    for name in ("JOURNAL_FILE", "LOG_FILE", "ENV_FILE", "STATE_FILE"):
+    for name in ("LOG_FILE", "ENV_FILE", "STATE_FILE"):
         monkeypatch.setattr(m, name, str(tmp_path / name.lower()))
+    monkeypatch.setattr(m, "JOURNAL_DIR", str(tmp_path))
     (tmp_path / "env_file").write_text("MODE=paper\nRISK_PER_TRADE_PCT=1\n", encoding="utf-8")
     return tmp_path
 
@@ -172,7 +173,7 @@ def test_exit_on_take_and_journal(files):
     bot.handle("/trades")
     assert "Сделок: 1" in bot.tg.last
     bot.handle("/journal")
-    assert bot.tg.docs == [m.JOURNAL_FILE]
+    assert bot.tg.docs == [str(files / "journal_paper.csv")]
 
 
 def test_exit_seen_on_candle_closed_between_polls(files):
@@ -358,3 +359,14 @@ def test_entry_uses_current_price_and_skips_runaway(files):
     assert abs(pos["amount"] * (pos["signal"].entry - pos["signal"].stop) - pos["risk"]) < 1e-9
     assert abs(pos["risk"] - 2) < 0.01
     assert any("плечо x" in t for t in bot.tg.sent)
+
+
+def test_journal_is_separate_per_mode(files):
+    bot = make_bot(files)
+    bot.tick()
+    bot.handle("/close all да")
+    bot.tick()
+    assert (files / "journal_paper.csv").exists()
+    live = make_bot(files, mode="live")
+    live.handle("/trades")
+    assert "Сделок пока не было" in live.tg.last

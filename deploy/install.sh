@@ -56,4 +56,4 @@ echo
 echo "Готово. Бот работает в фоне и запускается сам после перезагрузки сервера."
 echo "  Лог в реальном времени:  sudo journalctl -u $SERVICE -f"
 echo "  Настройки:               sudo nano $APP_DIR/.env  (затем sudo systemctl restart $SERVICE)"
-echo "  Журнал сделок:           cat $APP_DIR/journal.csv"
+echo "  Журнал сделок:           cat $APP_DIR/journal_*.csv"

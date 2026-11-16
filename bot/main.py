@@ -25,6 +25,7 @@ POLL_SECONDS = 10
 MAX_CANDLES = 1500   # больше Binance не отдаёт за один запрос
 SCAN_DELAY_MS = 15_000  # ждём после закрытия свечи, пока биржа её сформирует
 MIN_RR_AT_ENTRY = 1.5   # не входить, если по текущей цене тейк меньше 1.5 стопа
+TRADFI_AGREEMENT_ERROR = "-4411"  # Binance: не подписано соглашение TradFi-Perps
 JOURNAL_DIR = ROOT  # журнал свой для каждого режима: journal_paper.csv, journal_live.csv…
 LOG_FILE = os.path.join(ROOT, "bot.log")
 RESTART_EXIT_CODE = 3  # systemd перезапускает бота при ненулевом коде выхода
@@ -153,6 +154,7 @@ class TradingBot:
                                cfg.max_consecutive_losses, cfg.pause_hours)
         self.symbols = []
         self.symbols_day = None
+        self.blocked = {}
         self.trading_enabled = True
         self.halted_reason = None  # причина остановки по лимитам риска
         self.last_candle_ts = None
@@ -210,6 +212,7 @@ class TradingBot:
             return
         self.symbols = resolve_symbols(self.ex, self.cfg.symbols)
         self.symbols_day = today
+        self.blocked = {}  # монеты, которые биржа не даёт торговать, — до следующих суток
         log.info("Монеты (%d): %s", len(self.symbols), ", ".join(short(s) for s in self.symbols))
 
     def tick(self):
@@ -256,7 +259,7 @@ class TradingBot:
         cfg = self.cfg
         signals, checked = [], 0
         for symbol in self.symbols:  # порядок = приоритет (по ликвидности)
-            if symbol in self.broker.positions:
+            if symbol in self.broker.positions or symbol in self.blocked:
                 continue
             try:
                 candles = [c for c in self.ex.fetch_ohlcv(symbol, cfg.timeframe, limit=self.limit)
@@ -307,7 +310,14 @@ class TradingBot:
                 ok = self.broker.open(symbol, entry_sig, amount, risk, closed_ts, now_ms, leverage)
             except Exception as e:
                 log.exception("%s: не удалось открыть позицию", symbol)
-                self.tg.error(f"{short(symbol)}: не удалось открыть позицию: {e}"[:500])
+                if TRADFI_AGREEMENT_ERROR in str(e):
+                    self.blocked[symbol] = "нужно соглашение TradFi-Perps"
+                    self.tg.send(f"⚠️ {short(symbol)} — акция или металл (TradFi-Perps). Binance не даёт "
+                                 "их торговать, пока на binance.com не подписано соглашение "
+                                 "TradFi-Perps. Позиция не открыта. До конца суток бот такие "
+                                 "монеты пропускает.")
+                else:
+                    self.tg.error(f"{short(symbol)}: не удалось открыть позицию: {e}"[:500])
                 continue
             if ok:
                 opened.append(symbol)

@@ -132,3 +132,31 @@ def test_leverage_is_set_per_trade_only_when_it_changes():
     b.positions.clear()
     b.open("SOL/USDT:USDT", SIG, 0.4, 2.0, 0, 3000, leverage=3)
     assert calls == [("SOL/USDT:USDT", 5), ("SOL/USDT:USDT", 3)]
+
+
+def test_margin_already_isolated_is_fine():
+    import ccxt
+    ex = FakeCcxt()
+
+    def already(mode, symbol):
+        raise ccxt.OperationRejected('binanceusdm {"code":-4046,"msg":"No need to change margin type."}')
+    ex.set_margin_mode = already
+    assert BinancePortfolio(ex).open("SOL/USDT:USDT", SIG, 0.4, 2.0, 0, 1000, leverage=5)
+
+
+def test_margin_mode_failure_blocks_entry():
+    """Иначе позиция открылась бы на кросс-марже."""
+    import ccxt
+    ex = FakeCcxt()
+
+    def agreement(mode, symbol):
+        raise ccxt.ExchangeError('binanceusdm {"code":-4411,"msg":"Please sign TradFi-Perps agreement contract fapi."}')
+    ex.set_margin_mode = agreement
+    b = BinancePortfolio(ex)
+    with pytest.raises(ccxt.ExchangeError):
+        b.open("SKHYNIX/USDT:USDT", SIG, 0.4, 2.0, 0, 1000, leverage=5)
+    assert ex.orders == [] and not b.positions
+    # после подписания соглашения маржу снова пытаемся сделать изолированной
+    ex.set_margin_mode = lambda mode, symbol: ex.orders.append(("margin", mode, symbol, {}))
+    assert b.open("SKHYNIX/USDT:USDT", SIG, 0.4, 2.0, 0, 2000, leverage=5)
+    assert ex.orders[0] == ("margin", "isolated", "SKHYNIX/USDT:USDT", {})

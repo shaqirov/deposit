@@ -145,8 +145,11 @@ class BinancePortfolio:
         if symbol not in self.margin_set:
             try:
                 self.ex.set_margin_mode("isolated", symbol)
-            except ccxt.ExchangeError as e:  # уже isolated
-                log.debug("set_margin_mode %s: %s", symbol, e)
+            except ccxt.ExchangeError as e:
+                # -4046: маржа уже изолированная. Любая другая ошибка — не входим,
+                # иначе позиция откроется на кросс-марже и рискнёт всем счётом
+                if "-4046" not in str(e):
+                    raise
             self.margin_set.add(symbol)
         if self.leverage.get(symbol) != leverage:
             self.ex.set_leverage(leverage, symbol)

@@ -370,3 +370,23 @@ def test_journal_is_separate_per_mode(files):
     live = make_bot(files, mode="live")
     live.handle("/trades")
     assert "Сделок пока не было" in live.tg.last
+
+
+def test_tradfi_agreement_error_blocks_symbol_for_the_day(files):
+    bot = make_bot(files)
+    calls = []
+    real_open = bot.broker.open
+
+    def open_(symbol, *a, **k):
+        calls.append(symbol)
+        if symbol == "A/USDT:USDT":
+            raise RuntimeError('binanceusdm {"code":-4411,"msg":"Please sign TradFi-Perps agreement contract fapi."}')
+        return real_open(symbol, *a, **k)
+    bot.broker.open = open_
+    bot.tick()
+    assert list(bot.broker.positions) == ["B/USDT:USDT"]  # ошибка по A не мешает B
+    msgs = [t for t in bot.tg.sent if "TradFi-Perps" in t]
+    assert len(msgs) == 1 and not any(t.startswith("ERR") for t in bot.tg.sent)
+    bot.ex.next_candle()
+    bot.tick()
+    assert calls.count("A/USDT:USDT") == 1  # до следующих суток A не трогаем

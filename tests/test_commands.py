@@ -421,3 +421,29 @@ def test_warns_when_symbol_list_is_almost_empty(files):
     ok = make_bot(files)
     ok.refresh_symbols()
     assert not any("монет из" in t for t in ok.tg.sent)
+
+
+def test_crypto_only_setting_and_coins_reset(files):
+    from bot.portfolio import top_symbols
+    ex = FakeEx()
+    ex.markets["XAU/USDT:USDT"] = {"swap": True, "linear": True, "quote": "USDT", "active": True,
+                                   "base": "XAU", "info": {"underlyingType": "COMMODITY"}}
+    tickers = ex.fetch_tickers()
+    tickers["XAU/USDT:USDT"] = {"quoteVolume": 9e9}
+    ex.fetch_tickers = lambda: tickers
+    assert top_symbols(ex, 2, crypto_only=False) == ["XAU/USDT:USDT", "A/USDT:USDT"]
+
+    bot = make_bot(files, ex=ex, crypto_only=False)
+    bot.excluded.add("A/USDT:USDT")
+    bot.refresh_symbols()
+    assert bot.symbols[0] == "XAU/USDT:USDT" and "A/USDT:USDT" not in bot.symbols
+    bot.handle("/coins reset")
+    assert not bot.excluded
+    bot.refresh_symbols()
+    assert "A/USDT:USDT" in bot.symbols
+
+    bot.handle("/set CRYPTO_ONLY может")
+    assert "true или false" in bot.tg.last
+    with pytest.raises(m.Restart):
+        bot.handle("/set crypto_only false")
+    assert "CRYPTO_ONLY=false\n" in (files / "env_file").read_text(encoding="utf-8")

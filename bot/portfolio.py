@@ -59,8 +59,11 @@ def is_crypto(market):
     return not any(mark in x.upper() for x in labels for mark in ("TRADFI", "TRADIFI"))
 
 
-def top_symbols(ex, top, exclude=()):
-    """Самые ликвидные бессрочные фьючерсы на криптовалюты к USDT по объёму за 24 часа."""
+def top_symbols(ex, top, exclude=(), crypto_only=True):
+    """Самые ликвидные бессрочные фьючерсы к USDT по объёму за 24 часа.
+
+    crypto_only — без акций, металлов и нефти (TradFi-Perps).
+    """
     ex.load_markets()
     tickers = ex.fetch_tickers()
     rows = []
@@ -70,7 +73,7 @@ def top_symbols(ex, top, exclude=()):
             continue
         if not m.get("active", True) or m.get("base") in EXCLUDE_BASES or symbol in exclude:
             continue
-        if not is_crypto(m):
+        if crypto_only and not is_crypto(m):
             continue
         rows.append((t.get("quoteVolume") or 0, symbol))
     rows.sort(reverse=True)
@@ -236,6 +239,7 @@ def main():
     ap.add_argument("--horizon", type=int, default=180, help="срок разгона, дней")
     ap.add_argument("--step", type=int, default=14, help="шаг между стартами, дней")
     ap.add_argument("--no-funding", action="store_true", help="не загружать funding (быстрее)")
+    ap.add_argument("--with-tradfi", action="store_true", help="включить акции, металлы и нефть")
     args = ap.parse_args()
 
     cfg = load_config()
@@ -246,7 +250,7 @@ def main():
         symbols = [f"{t.strip().upper()}/USDT:USDT" for t in args.symbols.split(",") if t.strip()]
     else:
         print(f"Выбираю {args.top} самых ликвидных монет...")
-        symbols = top_symbols(ex, args.top)
+        symbols = top_symbols(ex, args.top, crypto_only=not args.with_tradfi)
     print(f"Монеты: {', '.join(s.split('/')[0] for s in symbols)}")
 
     with_funding = not args.no_funding and cfg.strategy.max_funding_pct > 0

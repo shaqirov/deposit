@@ -48,6 +48,7 @@ SETTINGS = {
     "TAKE_PROFIT_RR": (float, 1, 10, "тейк в стопах"),
     "STOP_ATR_MULT": (float, 0.5, 10, "стоп в ATR"),
     "SYMBOLS": (str, None, None, "TOP30 или список: BTC,ETH,SOL"),
+    "CRYPTO_ONLY": (bool, None, None, "true — в TOP30 только крипта, false — и акции/металлы"),
     "TIMEFRAME": (str, None, None, "таймфрейм: " + ", ".join(TIMEFRAMES)),
 }
 SETTINGS_ATTR = {
@@ -55,7 +56,7 @@ SETTINGS_ATTR = {
     "MAX_TOTAL_RISK_PCT": "max_total_risk_pct", "LEVERAGE": "leverage",
     "TARGET_PROFIT_PCT": "target_profit_pct", "MAX_DRAWDOWN_PCT": "max_drawdown_pct",
     "MAX_CONSECUTIVE_LOSSES": "max_consecutive_losses", "PAUSE_HOURS": "pause_hours",
-    "SYMBOLS": "symbols", "TIMEFRAME": "timeframe",
+    "SYMBOLS": "symbols", "CRYPTO_ONLY": "crypto_only", "TIMEFRAME": "timeframe",
     "MAX_FUNDING_PCT": "strategy.max_funding_pct", "DONCHIAN_PERIOD": "strategy.donchian_period",
     "TAKE_PROFIT_RR": "strategy.take_profit_rr", "STOP_ATR_MULT": "strategy.stop_atr_mult",
 }
@@ -75,7 +76,7 @@ COMMANDS = [
     ("status", "депозит, позиции, состояние"),
     ("trades", "последние сделки и статистика"),
     ("journal", "журнал сделок файлом (Excel)"),
-    ("coins", "монеты, которыми торгует бот"),
+    ("coins", "монеты бота; /coins reset — вернуть исключённые"),
     ("pause", "не открывать новые сделки"),
     ("resume", "возобновить торговлю"),
     ("close", "закрыть позицию: /close SOL да или /close all да"),
@@ -112,11 +113,11 @@ def short(symbol):
     return symbol.split("/")[0]
 
 
-def resolve_symbols(ex, spec, exclude=()):
-    """TOP30 -> 30 самых ликвидных криптовалют; 'BTC,ETH' -> список фьючерсов к USDT."""
+def resolve_symbols(ex, spec, exclude=(), crypto_only=True):
+    """TOP30 -> 30 самых ликвидных фьючерсов; 'BTC,ETH' -> список фьючерсов к USDT."""
     spec = spec.upper().replace(" ", "")
     if spec.startswith("TOP"):
-        return top_symbols(ex, int(spec[3:] or 30), exclude)
+        return top_symbols(ex, int(spec[3:] or 30), exclude, crypto_only)
     ex.load_markets()
     symbols = [t if "/" in t else f"{t}/USDT:USDT" for t in spec.split(",") if t]
     return [s for s in symbols if s in ex.markets and s not in exclude]
@@ -212,7 +213,7 @@ class TradingBot:
         today = datetime.now(timezone.utc).date().isoformat()
         if self.symbols and self.symbols_day == today:
             return
-        self.symbols = resolve_symbols(self.ex, self.cfg.symbols, self.excluded)
+        self.symbols = resolve_symbols(self.ex, self.cfg.symbols, self.excluded, self.cfg.crypto_only)
         self.symbols_day = today
         spec = self.cfg.symbols.upper().replace(" ", "")
         wanted = int(spec[3:] or 30) if spec.startswith("TOP") else len([t for t in spec.split(",") if t])
@@ -448,6 +449,11 @@ class TradingBot:
         self.tg.send("\n".join(lines))
 
     def cmd_coins(self, args):
+        if args[:1] == ["reset"]:
+            self.excluded.clear()
+            self.symbols_day = None  # пересобрать список на следующем цикле
+            self.tg.send("Список исключённых монет очищен, список монет обновится в течение минуты.")
+            return
         text = (f"Монеты ({len(self.symbols)}), по убыванию ликвидности:\n"
                 + ", ".join(short(s) for s in self.symbols))
         if self.excluded:
@@ -529,6 +535,11 @@ class TradingBot:
         typ, lo, hi, _ = SETTINGS[key]
         if key == "SYMBOLS":
             return validate_symbols_spec(self.ex, raw)
+        if typ is bool:
+            value = raw.strip().lower()
+            if value not in ("true", "false", "да", "нет"):
+                return None, f"{key}: true или false"
+            return ("true" if value in ("true", "да") else "false"), None
         if key == "TIMEFRAME":
             value = raw.lower()
             if value not in TIMEFRAMES:

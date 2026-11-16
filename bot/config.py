@@ -13,6 +13,7 @@ class Config:
     mode: str
     symbol: str          # для одиночного бэктеста (bot.backtest, bot.compare)
     symbols: str         # для бота: TOP30 (самые ликвидные) или список BTC,ETH,SOL
+    crypto_only: bool    # TOP-N без акций, металлов и нефти (TradFi-Perps)
     max_positions: int
     max_total_risk_pct: float
     timeframe: str
@@ -43,6 +44,7 @@ def load_config():
         mode=mode,
         symbol=env("SYMBOL", "BTC/USDT:USDT"),
         symbols=env("SYMBOLS", "TOP30").upper(),
+        crypto_only=env("CRYPTO_ONLY", "true").lower() in ("1", "true", "yes", "да"),
         max_positions=int(env("MAX_POSITIONS", "6")),
         max_total_risk_pct=float(env("MAX_TOTAL_RISK_PCT", "20")),
         timeframe=env("TIMEFRAME", "4h"),

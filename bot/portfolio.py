@@ -44,8 +44,23 @@ class PortfolioParams:
     start_balance: float = 100.0
 
 
-def top_symbols(ex, top):
-    """Самые ликвидные бессрочные фьючерсы к USDT по объёму за 24 часа."""
+def is_crypto(market):
+    """Базовый актив — криптовалюта, а не акция, металл или нефть (TradFi-Perps).
+
+    Binance помечает тип базового актива в underlyingType (COIN — криптовалюта)
+    и в underlyingSubType / contractType. Точная разметка TradFi-контрактов не
+    проверена, поэтому смотрим на все три поля; если меток нет — криптовалюта.
+    Страховка на случай ошибки: бот исключает монету после отказа -4411.
+    """
+    info = (market or {}).get("info") or {}
+    if info.get("underlyingType") not in (None, "", "COIN"):
+        return False
+    labels = [str(x) for x in (info.get("underlyingSubType") or [])] + [str(info.get("contractType") or "")]
+    return not any(mark in x.upper() for x in labels for mark in ("TRADFI", "TRADIFI"))
+
+
+def top_symbols(ex, top, exclude=()):
+    """Самые ликвидные бессрочные фьючерсы на криптовалюты к USDT по объёму за 24 часа."""
     ex.load_markets()
     tickers = ex.fetch_tickers()
     rows = []
@@ -53,7 +68,9 @@ def top_symbols(ex, top):
         m = ex.markets.get(symbol)
         if not m or not m.get("swap") or not m.get("linear") or m.get("quote") != "USDT":
             continue
-        if not m.get("active", True) or m.get("base") in EXCLUDE_BASES:
+        if not m.get("active", True) or m.get("base") in EXCLUDE_BASES or symbol in exclude:
+            continue
+        if not is_crypto(m):
             continue
         rows.append((t.get("quoteVolume") or 0, symbol))
     rows.sort(reverse=True)

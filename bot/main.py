@@ -112,14 +112,14 @@ def short(symbol):
     return symbol.split("/")[0]
 
 
-def resolve_symbols(ex, spec):
-    """TOP30 -> 30 самых ликвидных монет; 'BTC,ETH' -> список фьючерсов к USDT."""
+def resolve_symbols(ex, spec, exclude=()):
+    """TOP30 -> 30 самых ликвидных криптовалют; 'BTC,ETH' -> список фьючерсов к USDT."""
     spec = spec.upper().replace(" ", "")
     if spec.startswith("TOP"):
-        return top_symbols(ex, int(spec[3:] or 30))
+        return top_symbols(ex, int(spec[3:] or 30), exclude)
     ex.load_markets()
     symbols = [t if "/" in t else f"{t}/USDT:USDT" for t in spec.split(",") if t]
-    return [s for s in symbols if s in ex.markets]
+    return [s for s in symbols if s in ex.markets and s not in exclude]
 
 
 def validate_symbols_spec(ex, raw):
@@ -154,7 +154,7 @@ class TradingBot:
                                cfg.max_consecutive_losses, cfg.pause_hours)
         self.symbols = []
         self.symbols_day = None
-        self.blocked = {}
+        self.excluded = set()  # монеты, которые биржа не даёт торговать (TradFi без соглашения)
         self.trading_enabled = True
         self.halted_reason = None  # причина остановки по лимитам риска
         self.last_candle_ts = None
@@ -177,6 +177,7 @@ class TradingBot:
             "trading_enabled": self.trading_enabled, "halted_reason": self.halted_reason,
             "last_candle_ts": self.last_candle_ts, "last_report_day": self.last_report_day,
             "day_trades": self.day_trades, "broker": self.broker.to_state(),
+            "excluded": sorted(self.excluded),
         }
 
     def load(self, st):
@@ -192,6 +193,7 @@ class TradingBot:
         self.halted_reason = st["halted_reason"]
         self.last_report_day = st.get("last_report_day", self.last_report_day)
         self.day_trades = st.get("day_trades", [])
+        self.excluded = set(st.get("excluded", []))
         if st.get("timeframe") == self.cfg.timeframe:
             self.last_candle_ts = st.get("last_candle_ts")
         self.broker.load_state(st["broker"])
@@ -210,9 +212,13 @@ class TradingBot:
         today = datetime.now(timezone.utc).date().isoformat()
         if self.symbols and self.symbols_day == today:
             return
-        self.symbols = resolve_symbols(self.ex, self.cfg.symbols)
+        self.symbols = resolve_symbols(self.ex, self.cfg.symbols, self.excluded)
         self.symbols_day = today
-        self.blocked = {}  # монеты, которые биржа не даёт торговать, — до следующих суток
+        spec = self.cfg.symbols.upper().replace(" ", "")
+        wanted = int(spec[3:] or 30) if spec.startswith("TOP") else len([t for t in spec.split(",") if t])
+        if len(self.symbols) < wanted / 2:
+            self.tg.error(f"Найдено всего {len(self.symbols)} монет из {wanted} — проверьте SYMBOLS "
+                          "(/settings) и список /coins.")
         log.info("Монеты (%d): %s", len(self.symbols), ", ".join(short(s) for s in self.symbols))
 
     def tick(self):
@@ -259,7 +265,7 @@ class TradingBot:
         cfg = self.cfg
         signals, checked = [], 0
         for symbol in self.symbols:  # порядок = приоритет (по ликвидности)
-            if symbol in self.broker.positions or symbol in self.blocked:
+            if symbol in self.broker.positions or symbol in self.excluded:
                 continue
             try:
                 candles = [c for c in self.ex.fetch_ohlcv(symbol, cfg.timeframe, limit=self.limit)
@@ -311,11 +317,11 @@ class TradingBot:
             except Exception as e:
                 log.exception("%s: не удалось открыть позицию", symbol)
                 if TRADFI_AGREEMENT_ERROR in str(e):
-                    self.blocked[symbol] = "нужно соглашение TradFi-Perps"
-                    self.tg.send(f"⚠️ {short(symbol)} — акция или металл (TradFi-Perps). Binance не даёт "
-                                 "их торговать, пока на binance.com не подписано соглашение "
-                                 "TradFi-Perps. Позиция не открыта. До конца суток бот такие "
-                                 "монеты пропускает.")
+                    self.excluded.add(symbol)
+                    self.symbols = [x for x in self.symbols if x != symbol]
+                    self.tg.send(f"⚠️ {short(symbol)} — акция или металл (TradFi-Perps), Binance не даёт "
+                                 "торговать ими этому аккаунту. Позиция не открыта, монета "
+                                 "исключена из торговли.")
                 else:
                     self.tg.error(f"{short(symbol)}: не удалось открыть позицию: {e}"[:500])
                 continue
@@ -442,8 +448,11 @@ class TradingBot:
         self.tg.send("\n".join(lines))
 
     def cmd_coins(self, args):
-        self.tg.send(f"Монеты ({len(self.symbols)}), по убыванию ликвидности:\n"
-                     + ", ".join(short(s) for s in self.symbols))
+        text = (f"Монеты ({len(self.symbols)}), по убыванию ликвидности:\n"
+                + ", ".join(short(s) for s in self.symbols))
+        if self.excluded:
+            text += "\n\nИсключены (биржа не даёт торговать): " + ", ".join(short(s) for s in sorted(self.excluded))
+        self.tg.send(text)
 
     def cmd_trades(self, args):
         rows = []

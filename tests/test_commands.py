@@ -372,7 +372,7 @@ def test_journal_is_separate_per_mode(files):
     assert "Сделок пока не было" in live.tg.last
 
 
-def test_tradfi_agreement_error_blocks_symbol_for_the_day(files):
+def test_tradfi_agreement_error_excludes_symbol_permanently(files):
     bot = make_bot(files)
     calls = []
     real_open = bot.broker.open
@@ -387,6 +387,37 @@ def test_tradfi_agreement_error_blocks_symbol_for_the_day(files):
     assert list(bot.broker.positions) == ["B/USDT:USDT"]  # ошибка по A не мешает B
     msgs = [t for t in bot.tg.sent if "TradFi-Perps" in t]
     assert len(msgs) == 1 and not any(t.startswith("ERR") for t in bot.tg.sent)
-    bot.ex.next_candle()
-    bot.tick()
-    assert calls.count("A/USDT:USDT") == 1  # до следующих суток A не трогаем
+    assert "A/USDT:USDT" not in bot.symbols
+    bot.handle("/coins")
+    assert "Исключены (биржа не даёт торговать): A" in bot.tg.last
+    # исключение переживает перезапуск и смену суток
+    bot.save()
+    again = make_bot(files, ex=bot.ex)
+    again.refresh_symbols()
+    assert "A/USDT:USDT" in again.excluded and "A/USDT:USDT" not in again.symbols
+
+
+def test_top_symbols_skips_tradfi():
+    from bot.portfolio import is_crypto, top_symbols
+    ex = FakeEx()
+    ex.markets["XAU/USDT:USDT"] = {"swap": True, "linear": True, "quote": "USDT", "active": True,
+                                   "base": "XAU", "info": {"underlyingType": "COMMODITY"}}
+    ex.markets["NVDA/USDT:USDT"] = {"swap": True, "linear": True, "quote": "USDT", "active": True,
+                                    "base": "NVDA", "info": {"underlyingType": "COIN",
+                                                             "contractType": "TRADIFI_PERPETUAL"}}
+    tickers = ex.fetch_tickers()
+    tickers.update({"XAU/USDT:USDT": {"quoteVolume": 9e9}, "NVDA/USDT:USDT": {"quoteVolume": 8e9}})
+    ex.fetch_tickers = lambda: tickers
+    assert top_symbols(ex, 3) == ["A/USDT:USDT", "B/USDT:USDT", "C/USDT:USDT"]
+    assert is_crypto({"info": {"underlyingType": "COIN", "underlyingSubType": ["Layer-1"]}})
+    assert not is_crypto({"info": {"underlyingType": "EQUITY"}})
+    assert not is_crypto({"info": {"underlyingSubType": ["TradFi"]}})
+
+
+def test_warns_when_symbol_list_is_almost_empty(files):
+    bot = make_bot(files, symbols="A,B,ZZZ,YYY,XXX")
+    bot.refresh_symbols()
+    assert any("всего 2 монет из 5" in t for t in bot.tg.sent)
+    ok = make_bot(files)
+    ok.refresh_symbols()
+    assert not any("монет из" in t for t in ok.tg.sent)

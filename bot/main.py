@@ -25,6 +25,7 @@ POLL_SECONDS = 10
 MAX_CANDLES = 1500   # больше Binance не отдаёт за один запрос
 SCAN_DELAY_MS = 15_000  # ждём после закрытия свечи, пока биржа её сформирует
 MIN_RR_AT_ENTRY = 1.5   # не входить, если по текущей цене тейк меньше 1.5 стопа
+FAIL_ALERT_AFTER = 3   # сообщать о сбое цикла, только если он повторился столько раз подряд
 TRADFI_AGREEMENT_ERROR = "-4411"  # Binance: не подписано соглашение TradFi-Perps
 JOURNAL_DIR = ROOT  # журнал свой для каждого режима: journal_paper.csv, journal_live.csv…
 LOG_FILE = os.path.join(ROOT, "bot.log")
@@ -164,6 +165,7 @@ class TradingBot:
         self.last_report_day = datetime.now(timezone.utc).date().isoformat()
         self.day_trades = []
         self.close_requests = set()
+        self.fail_streak = 0
         self.manual_closes = set()  # на бирже ручное закрытие увидит следующий check_exits
         self.restored = False
 
@@ -700,8 +702,18 @@ class TradingBot:
             try:
                 self.tick()
             except Exception as e:
-                log.exception("Ошибка в цикле, повтор через %d с", POLL_SECONDS)
-                self.tg.error(f"{type(e).__name__}: {e}"[:500])
+                # Одиночные сетевые заминки — обычное дело: стопы и тейки стоят на бирже,
+                # а цикл повторится через несколько секунд. Сообщаем только о затяжных сбоях
+                self.fail_streak += 1
+                log.exception("Ошибка в цикле (%d подряд), повтор через %d с", self.fail_streak, POLL_SECONDS)
+                if self.fail_streak == FAIL_ALERT_AFTER:
+                    self.tg.send(f"⚠️ Сбой {self.fail_streak} раза подряд: {type(e).__name__}: {e}"[:500]
+                                 + "\nСтопы и тейки на бирже продолжают работать. "
+                                 "Сообщу, когда восстановится.")
+            else:
+                if self.fail_streak >= FAIL_ALERT_AFTER:
+                    self.tg.send(f"✅ Работа восстановлена после {self.fail_streak} неудачных попыток.")
+                self.fail_streak = 0
             self.save()
             try:
                 for text in self.tg.poll(POLL_SECONDS):

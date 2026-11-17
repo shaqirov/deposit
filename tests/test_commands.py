@@ -447,3 +447,30 @@ def test_crypto_only_setting_and_coins_reset(files):
     with pytest.raises(m.Restart):
         bot.handle("/set crypto_only false")
     assert "CRYPTO_ONLY=false\n" in (files / "env_file").read_text(encoding="utf-8")
+
+
+def test_transient_errors_are_reported_only_when_they_persist(files):
+    ex = FakeEx()
+    script = ["/restart"]
+    tg = FakeTg()
+    failures = [True, False, True, True, True, True, False]
+
+    def poll(timeout):
+        if not failures:
+            return script
+        return []
+    tg.poll = poll
+    bot = make_bot(files, tg=tg, ex=ex)
+    real_tick = bot.tick
+
+    def tick():
+        if failures.pop(0):
+            raise TimeoutError("binanceusdm GET positionRisk timed out")
+        real_tick()
+    bot.tick = tick
+    with pytest.raises(SystemExit):
+        bot.run()
+    alerts = [t for t in tg.sent if t.startswith("⚠️ Сбой")]
+    recovered = [t for t in tg.sent if t.startswith("✅ Работа восстановлена")]
+    assert len(alerts) == 1 and "3 раза подряд" in alerts[0]
+    assert recovered == ["✅ Работа восстановлена после 4 неудачных попыток."]

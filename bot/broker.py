@@ -139,7 +139,16 @@ class BinancePortfolio:
         self.leverage = {}  # последнее выставленное плечо по монете
 
     def equity(self):
-        return float(self.ex.fetch_balance()["total"].get("USDT", 0))
+        """Баланс USDT на фьючерсном счёте без нереализованного PnL открытых позиций.
+
+        В ccxt total — это marginBalance (с нереализованным PnL): он скачет вместе
+        с ценами, а размер позиций и лимиты риска считаем от реальных денег.
+        """
+        bal = self.ex.fetch_balance()
+        for asset in (bal.get("info") or {}).get("assets") or []:
+            if asset.get("asset") == "USDT" and asset.get("walletBalance") is not None:
+                return float(asset["walletBalance"])
+        return float(bal["total"].get("USDT", 0))
 
     def _prepare(self, symbol, leverage):
         if symbol not in self.margin_set:

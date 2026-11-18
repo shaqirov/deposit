@@ -160,3 +160,16 @@ def test_margin_mode_failure_blocks_entry():
     ex.set_margin_mode = lambda mode, symbol: ex.orders.append(("margin", mode, symbol, {}))
     assert b.open("SKHYNIX/USDT:USDT", SIG, 0.4, 2.0, 0, 2000, leverage=5)
     assert ex.orders[0] == ("margin", "isolated", "SKHYNIX/USDT:USDT", {})
+
+
+def test_equity_is_wallet_balance_without_unrealized_pnl():
+    ex = FakeCcxt()
+    ex.fetch_balance = lambda: {
+        "total": {"USDT": 105.3},  # marginBalance: с нереализованным PnL
+        "info": {"assets": [{"asset": "BNB", "walletBalance": "1.0"},
+                            {"asset": "USDT", "walletBalance": "102.24", "unrealizedProfit": "3.06",
+                             "marginBalance": "105.30"}]},
+    }
+    assert BinancePortfolio(ex).equity() == 102.24
+    ex.fetch_balance = lambda: {"total": {"USDT": 100.0}, "info": {}}
+    assert BinancePortfolio(ex).equity() == 100.0  # запасной вариант

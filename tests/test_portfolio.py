@@ -79,3 +79,58 @@ def test_acceleration_odds_sum_to_100():
                           horizon_days=60, step_days=30, first_ts=prepared[0][0] + 60 * H)
     assert o["runs"] > 5
     assert abs(o["target_pct"] + o["ruin_pct"] + o["neither_pct"] - 100) < 1e-9
+
+
+def scripted(candles):
+    """Позиция long: вход 100, стоп 95 (R = 5), тейк 110; дальше — заданные свечи (high, low)."""
+    from bot.strategy import Signal
+    sig = Signal("long", 100.0, 95.0, 110.0)
+    timestamps = [0] + [(i + 1) * H for i in range(len(candles))]
+    candles_at = {0: {"X": [0, 100, 100, 100, 100, 1]}}
+    for ts, (high, low) in zip(timestamps[1:], candles):
+        candles_at[ts] = {"X": [ts, low, high, low, (high + low) / 2, 1]}
+    return timestamps, candles_at, {0: [(0, "X", sig, 0)]}
+
+
+def run_mode(mode, candles):
+    pp = PortfolioParams(risk_pct=1, max_positions=6, max_total_risk_pct=100, leverage=10,
+                         target_pct=1e9, ruin_pct=100, exit_mode=mode)
+    r = simulate(scripted(candles), pp, stop_at_target=False)
+    return [round(t["r"], 2) for t in r["trade_list"]]
+
+
+def test_exit_modes_on_scripted_path():
+    # +1.2R, откат к +0.1R, потом рост до +4R
+    path = [(106, 101), (104, 100.5), (120, 103)]
+    assert run_mode("fixed", path) == [1.98]        # тейк 2R минус комиссии
+    assert run_mode("breakeven", path) == [1.98]    # безубыток не задет, тейк
+    assert run_mode("trail", path) == [0.18]        # стоп подтянут до 101 и задет на откате
+    assert run_mode("trail_notake", path) == [0.18]
+    # без отката трейлинг без тейка забирает большее движение
+    trend = [(106, 101), (112, 105), (118, 111), (124, 117), (125, 112)]
+    assert run_mode("fixed", trend) == [1.98]
+    # стоп 101 -> 107 -> 113 -> 119, пятая свеча задевает 119: +3.8R минус комиссии
+    assert run_mode("trail_notake", trend) == [3.78]
+    # разворот сразу: все режимы теряют 1R
+    for mode in ("fixed", "breakeven", "trail", "trail_notake"):
+        assert run_mode(mode, [(101, 94)]) == [-1.02]
+
+
+def test_stop_moves_only_after_candle_close_and_only_forward():
+    from bot.exits import next_stop
+    # +0.8R — ещё не активировано
+    assert next_stop("trail", "long", 100, 95, 95, 104) == 95
+    # +2R — стоп на best - 1R
+    assert next_stop("trail", "long", 100, 95, 95, 110) == 105
+    # откат не опускает стоп
+    assert next_stop("trail", "long", 100, 95, 105, 107) == 105
+    # шорт зеркально
+    assert next_stop("trail", "short", 100, 105, 105, 90) == 95
+    assert next_stop("breakeven", "short", 100, 105, 105, 94) == 100 * (1 - 0.001)
+
+
+def test_breakeven_frees_risk_budget():
+    from bot.exits import open_risk
+    assert open_risk("long", 100, 95, 2) == 10
+    assert open_risk("long", 100, 100.1, 2) == 0
+    assert open_risk("short", 100, 99, 2) == 0

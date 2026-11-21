@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from .backtest import load_data
 from .broker import TAKER_FEE, make_exchange
 from .config import load_config
+from .exits import EXIT_MODES, best_price, hit_price, initial_take, next_stop, open_risk
 from .risk import portfolio_size
 from .state import ROOT
 from .strategy import StrategyParams, generate_signals
@@ -42,6 +43,7 @@ class PortfolioParams:
     target_pct: float = 100.0        # цель (x2 = 100%)
     ruin_pct: float = 50.0           # аварийная остановка при просадке от старта
     start_balance: float = 100.0
+    exit_mode: str = "fixed"         # см. bot/exits.py
 
 
 def is_crypto(market):
@@ -146,11 +148,11 @@ def simulate(prepared, pp: PortfolioParams, start_ts=None, end_ts=None, stop_at_
                 continue
             p = positions[symbol]
             s, amount = p["sig"], p["amount"]
-            if s.side == "long":
-                exit_price = s.stop if c[3] <= s.stop else s.take if c[2] >= s.take else None
-            else:
-                exit_price = s.stop if c[2] >= s.stop else s.take if c[3] <= s.take else None
+            exit_price = hit_price(s.side, p["stop"], p["take"], c[2], c[3])
             if exit_price is None:
+                # Свеча закрылась без выхода — подтягиваем стоп для следующих свечей
+                p["best"] = best_price(s.side, p["best"], c[2], c[3])
+                p["stop"] = next_stop(pp.exit_mode, s.side, s.entry, s.stop, p["stop"], p["best"])
                 continue
             direction = 1 if s.side == "long" else -1
             gross = (exit_price - s.entry) * amount * direction
@@ -176,15 +178,21 @@ def simulate(prepared, pp: PortfolioParams, start_ts=None, end_ts=None, stop_at_
                 break
             if symbol in positions:
                 continue
+            # В лимит суммарного риска идёт то, что ещё можно потерять: у позиции со стопом
+            # в безубытке риск уже 0
             sized = portfolio_size(
                 balance, sig.entry, sig.stop, pp.risk_pct,
-                [(p["sig"].entry, p["amount"], p["risk"], p["sig"].stop) for p in positions.values()],
+                [(p["sig"].entry, p["amount"],
+                  open_risk(p["sig"].side, p["sig"].entry, p["stop"], p["amount"]), p["sig"].stop)
+                 for p in positions.values()],
                 pp.max_total_risk_pct, pp.leverage, min_cost)
             if not sized:
                 continue
             amount, risk, _ = sized
             balance -= sig.entry * amount * TAKER_FEE
-            positions[symbol] = {"sig": sig, "amount": amount, "risk": risk, "open_ts": ts}
+            positions[symbol] = {"sig": sig, "amount": amount, "risk": risk, "open_ts": ts,
+                                 "stop": sig.stop, "take": initial_take(pp.exit_mode, sig.take),
+                                 "best": sig.entry}
 
     wins = [t for t in trades if t["pnl"] > 0]
     last_ts = outcome_ts or (end_ts if end_ts is not None else timestamps[-1])
@@ -240,6 +248,8 @@ def main():
     ap.add_argument("--step", type=int, default=14, help="шаг между стартами, дней")
     ap.add_argument("--no-funding", action="store_true", help="не загружать funding (быстрее)")
     ap.add_argument("--with-tradfi", action="store_true", help="включить акции, металлы и нефть")
+    ap.add_argument("--exit-modes", default="fixed",
+                    help=f"режимы выхода через запятую: {', '.join(EXIT_MODES)} (см. bot/exits.py)")
     args = ap.parse_args()
 
     cfg = load_config()
@@ -275,30 +285,38 @@ def main():
     print(f"\nМонет в портфеле: {len(data)}, период {years:.1f} г., старт 100 USDT, "
           f"до {args.max_positions} позиций, суммарный риск до {args.max_total_risk:g}%, "
           f"плечо до x{args.leverage:g}\n")
+    risks = [float(x) for x in args.risks.split(",")]
+    modes = [m.strip() for m in args.exit_modes.split(",")]
+    unknown = [m for m in modes if m not in EXIT_MODES]
+    if unknown:
+        raise SystemExit(f"Неизвестные режимы выхода: {', '.join(unknown)}. Доступны: {', '.join(EXIT_MODES)}")
+
+    def params(mode, risk):
+        return PortfolioParams(risk, args.max_positions, args.max_total_risk, args.leverage,
+                               args.target, args.ruin, exit_mode=mode)
+
     print("Весь период (без остановки на цели; аварийная остановка — при "
           f"-{args.ruin:g}%):")
-    print(f"{'Риск':>6}{'Итог %':>10}{'Сделок':>8}{'Винрейт':>9}{'Просадка':>10}"
+    print(f"{'Выход':<14}{'Риск':>5}{'Итог %':>10}{'Сделок':>8}{'Винрейт':>9}{'Просадка':>10}"
           f"{'1-я пол.':>10}{'2-я пол.':>10}  Чем кончилось")
-    for risk in [float(x) for x in args.risks.split(",")]:
-        pp = PortfolioParams(risk, args.max_positions, args.max_total_risk, args.leverage,
-                             args.target, args.ruin)
-        r = simulate(prepared, pp, first_ts, stop_at_target=False)
-        end = "аварийная остановка" if r["outcome"] == "ruin" else "доработал до конца"
-        print(f"{risk:>5g}%{r['return_pct']:>+10.1f}{r['trades']:>8}{r['winrate_pct']:>8.1f}%"
-              f"{r['max_drawdown_pct']:>9.1f}%{r['first_half_pct']:>+10.1f}"
-              f"{r['second_half_pct']:>+10.1f}  {end}")
+    for mode in modes:
+        for risk in risks:
+            r = simulate(prepared, params(mode, risk), first_ts, stop_at_target=False)
+            end = "аварийная остановка" if r["outcome"] == "ruin" else "доработал до конца"
+            print(f"{mode:<14}{risk:>4g}%{r['return_pct']:>+10.1f}{r['trades']:>8}"
+                  f"{r['winrate_pct']:>8.1f}%{r['max_drawdown_pct']:>9.1f}%"
+                  f"{r['first_half_pct']:>+10.1f}{r['second_half_pct']:>+10.1f}  {end}")
 
     print(f"\nШансы разгона: старт с разных дат каждые {args.step} дн., срок {args.horizon} дн., "
           f"цель +{args.target:g}%, аварийная остановка -{args.ruin:g}%:")
-    print(f"{'Риск':>6}{'Стартов':>9}{'Цель':>8}{'Авария':>8}{'Ни то ни др.':>14}"
+    print(f"{'Выход':<14}{'Риск':>5}{'Стартов':>9}{'Цель':>8}{'Авария':>8}{'Ни то ни др.':>14}"
           f"{'Дней до цели':>14}{'Медиана итога':>15}")
-    for risk in [float(x) for x in args.risks.split(",")]:
-        pp = PortfolioParams(risk, args.max_positions, args.max_total_risk, args.leverage,
-                             args.target, args.ruin)
-        o = acceleration_odds(prepared, pp, args.horizon, args.step, first_ts)
-        days = f"{o['median_days_to_target']:.0f}" if o["median_days_to_target"] else "—"
-        print(f"{risk:>5g}%{o['runs']:>9}{o['target_pct']:>7.0f}%{o['ruin_pct']:>7.0f}%"
-              f"{o['neither_pct']:>13.0f}%{days:>14}{o['median_return_pct']:>+14.1f}%")
+    for mode in modes:
+        for risk in risks:
+            o = acceleration_odds(prepared, params(mode, risk), args.horizon, args.step, first_ts)
+            days = f"{o['median_days_to_target']:.0f}" if o["median_days_to_target"] else "—"
+            print(f"{mode:<14}{risk:>4g}%{o['runs']:>9}{o['target_pct']:>7.0f}%{o['ruin_pct']:>7.0f}%"
+                  f"{o['neither_pct']:>13.0f}%{days:>14}{o['median_return_pct']:>+14.1f}%")
 
     print("\nВажно: монеты выбраны по сегодняшнему объёму торгов. Те, что за эти годы "
           "рухнули или были удалены с биржи, в проверку не попали, поэтому реальные "

@@ -106,9 +106,10 @@ def cached_data(ex, symbol, timeframe, days, with_funding):
     return candles, funding
 
 
-def prepare(data, strategy: StrategyParams):
+def prepare(data, strategy: StrategyParams, sides=("long", "short")):
     """data: {symbol: (candles, funding, min_notional)} в порядке приоритета.
 
+    sides — какие сигналы брать (для акций без шортов — только "long").
     Возвращает (timestamps, candles_at, signals_at): свечи и сигналы по времени.
     """
     candles_at, signals_at = {}, {}
@@ -116,7 +117,7 @@ def prepare(data, strategy: StrategyParams):
         signals = generate_signals(candles, strategy, funding)
         for c, sig in zip(candles, signals):
             candles_at.setdefault(c[0], {})[symbol] = c
-            if sig:
+            if sig and sig.side in sides:
                 signals_at.setdefault(c[0], []).append((rank, symbol, sig, min_cost))
     for lst in signals_at.values():
         lst.sort(key=lambda x: x[0])

@@ -87,8 +87,12 @@ def scripted(candles):
     sig = Signal("long", 100.0, 95.0, 110.0)
     timestamps = [0] + [(i + 1) * H for i in range(len(candles))]
     candles_at = {0: {"X": [0, 100, 100, 100, 100, 1]}}
+    close = 100.0
     for ts, (high, low) in zip(timestamps[1:], candles):
-        candles_at[ts] = {"X": [ts, low, high, low, (high + low) / 2, 1]}
+        # открытие = закрытие предыдущей свечи, без ценовых разрывов
+        open_ = min(max(close, low), high)
+        close = (high + low) / 2
+        candles_at[ts] = {"X": [ts, open_, high, low, close, 1]}
     return timestamps, candles_at, {0: [(0, "X", sig, 0)]}
 
 
@@ -134,3 +138,49 @@ def test_breakeven_frees_risk_budget():
     assert open_risk("long", 100, 95, 2) == 10
     assert open_risk("long", 100, 100.1, 2) == 0
     assert open_risk("short", 100, 99, 2) == 0
+
+
+def test_gap_through_stop_exits_at_open_and_slippage_costs():
+    from bot.exits import hit_price
+    assert hit_price("long", 95, 110, 99, 90, open_=92) == 92   # открылась ниже стопа
+    assert hit_price("long", 95, 110, 99, 94, open_=98) == 95
+    assert hit_price("short", 105, 90, 112, 101, open_=108) == 108
+    path = [(101, 94)]
+
+    def r_with(slippage):
+        pp = PortfolioParams(risk_pct=1, max_positions=6, max_total_risk_pct=100, leverage=10,
+                             target_pct=1e9, ruin_pct=100, slippage_pct=slippage)
+        return simulate(scripted(path), pp, stop_at_target=False)["trade_list"][0]["r"]
+    base, slipped = r_with(0), r_with(0.1)
+    # 0.1% от 100 на входе и от 95 на выходе при объёме 0.2 = 0.039 USDT = 0.039R
+    assert abs((slipped - base) - (-0.039)) < 1e-9
+
+
+def fine_walk(n, seed, steps=24, vol=0.012):
+    """Свечи из мелких шагов честного случайного блуждания: high/low — настоящие экстремумы."""
+    rnd = random.Random(seed)
+    s = vol / steps ** 0.5
+    price, out = 100.0, []
+    for i in range(n):
+        o = hi = lo = price
+        for _ in range(steps):
+            price += price * rnd.gauss(0, s)
+            hi, lo = max(hi, price), min(lo, price)
+        out.append([i * H, o, hi, lo, price, 1.0])
+    return out
+
+
+def test_no_exit_mode_profits_on_a_random_walk():
+    """На рынке без тренда никакой способ выхода не может зарабатывать заметно больше нуля:
+    иначе бэктест заглядывает в будущее или завышает исполнение."""
+    from statistics import mean
+    for mode in ("fixed", "breakeven", "trail", "trail_notake"):
+        rs = []
+        for seed in range(6):
+            data = {f"S{k}": (fine_walk(2000, seed * 10 + k), None, 0) for k in range(4)}
+            pp = PortfolioParams(risk_pct=1, max_positions=6, max_total_risk_pct=20, leverage=10,
+                                 target_pct=1e9, ruin_pct=100, exit_mode=mode)
+            rs += [t["r"] for t in simulate(prepare(data, StrategyParams()), pp,
+                                            stop_at_target=False)["trade_list"]]
+        assert len(rs) > 300
+        assert mean(rs) < 0.06, (mode, mean(rs))

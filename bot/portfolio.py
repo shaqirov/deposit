@@ -44,6 +44,9 @@ class PortfolioParams:
     ruin_pct: float = 50.0           # аварийная остановка при просадке от старта
     start_balance: float = 100.0
     exit_mode: str = "fixed"         # см. bot/exits.py
+    activate_r: float = 1.0          # трейлинг/безубыток включается после +activate_r R
+    trail_r: float = 1.0             # трейлинг держит стоп на trail_r R от лучшей цены
+    slippage_pct: float = 0.0        # проскальзывание рыночных ордеров, % на каждый вход и выход
 
 
 def is_crypto(market):
@@ -148,14 +151,19 @@ def simulate(prepared, pp: PortfolioParams, start_ts=None, end_ts=None, stop_at_
                 continue
             p = positions[symbol]
             s, amount = p["sig"], p["amount"]
-            exit_price = hit_price(s.side, p["stop"], p["take"], c[2], c[3])
+            exit_price = hit_price(s.side, p["stop"], p["take"], c[2], c[3], c[1])
             if exit_price is None:
                 # Свеча закрылась без выхода — подтягиваем стоп для следующих свечей
                 p["best"] = best_price(s.side, p["best"], c[2], c[3])
-                p["stop"] = next_stop(pp.exit_mode, s.side, s.entry, s.stop, p["stop"], p["best"])
+                p["stop"] = next_stop(pp.exit_mode, s.side, s.entry, s.stop, p["stop"], p["best"],
+                                      pp.activate_r, pp.trail_r)
                 continue
             direction = 1 if s.side == "long" else -1
-            gross = (exit_price - s.entry) * amount * direction
+            # Вход и выход — рыночные ордера: проскальзывание всегда против нас
+            slip = pp.slippage_pct / 100
+            entry_filled = s.entry * (1 + direction * slip)
+            exit_filled = exit_price * (1 - direction * slip)
+            gross = (exit_filled - entry_filled) * amount * direction
             exit_fee = exit_price * amount * TAKER_FEE
             balance += gross - exit_fee
             pnl = gross - exit_fee - s.entry * amount * TAKER_FEE
@@ -248,6 +256,10 @@ def main():
     ap.add_argument("--step", type=int, default=14, help="шаг между стартами, дней")
     ap.add_argument("--no-funding", action="store_true", help="не загружать funding (быстрее)")
     ap.add_argument("--with-tradfi", action="store_true", help="включить акции, металлы и нефть")
+    ap.add_argument("--activate-r", default="1", help="трейлинг: после скольких R включать, через запятую")
+    ap.add_argument("--trail-r", default="1", help="трейлинг: расстояние стопа в R, через запятую")
+    ap.add_argument("--slippage", type=float, default=0.0,
+                    help="проскальзывание на каждый вход и выход, %% (например 0.05)")
     ap.add_argument("--exit-modes", default="fixed",
                     help=f"режимы выхода через запятую: {', '.join(EXIT_MODES)} (см. bot/exits.py)")
     args = ap.parse_args()
@@ -291,31 +303,46 @@ def main():
     if unknown:
         raise SystemExit(f"Неизвестные режимы выхода: {', '.join(unknown)}. Доступны: {', '.join(EXIT_MODES)}")
 
-    def params(mode, risk):
-        return PortfolioParams(risk, args.max_positions, args.max_total_risk, args.leverage,
-                               args.target, args.ruin, exit_mode=mode)
+    activates = [float(x) for x in args.activate_r.split(",")]
+    trails = [float(x) for x in args.trail_r.split(",")]
+    # (подпись, параметры) для каждой комбинации; для fixed параметры трейлинга не важны
+    variants = []
+    for mode in modes:
+        combos = [(1.0, 1.0)] if mode == "fixed" else [(a, t) for a in activates for t in trails]
+        if mode == "breakeven":
+            combos = sorted({(a, 1.0) for a in activates})
+        for a, t in combos:
+            label = mode if mode == "fixed" else (f"{mode} {a:g}" if mode == "breakeven" else f"{mode} {a:g}/{t:g}")
+            variants.append((label, mode, a, t))
 
+    def params(variant, risk):
+        _, mode, a, t = variant
+        return PortfolioParams(risk, args.max_positions, args.max_total_risk, args.leverage,
+                               args.target, args.ruin, exit_mode=mode, activate_r=a, trail_r=t,
+                               slippage_pct=args.slippage)
+
+    print(f"Выход: режим [включение R / расстояние R], проскальзывание {args.slippage:g}% на ордер\n")
     print("Весь период (без остановки на цели; аварийная остановка — при "
           f"-{args.ruin:g}%):")
-    print(f"{'Выход':<14}{'Риск':>5}{'Итог %':>10}{'Сделок':>8}{'Винрейт':>9}{'Просадка':>10}"
+    print(f"{'Выход':<22}{'Риск':>5}{'Итог %':>10}{'Сделок':>8}{'Винрейт':>9}{'Просадка':>10}"
           f"{'1-я пол.':>10}{'2-я пол.':>10}  Чем кончилось")
-    for mode in modes:
+    for v in variants:
         for risk in risks:
-            r = simulate(prepared, params(mode, risk), first_ts, stop_at_target=False)
+            r = simulate(prepared, params(v, risk), first_ts, stop_at_target=False)
             end = "аварийная остановка" if r["outcome"] == "ruin" else "доработал до конца"
-            print(f"{mode:<14}{risk:>4g}%{r['return_pct']:>+10.1f}{r['trades']:>8}"
+            print(f"{v[0]:<22}{risk:>4g}%{r['return_pct']:>+10.1f}{r['trades']:>8}"
                   f"{r['winrate_pct']:>8.1f}%{r['max_drawdown_pct']:>9.1f}%"
                   f"{r['first_half_pct']:>+10.1f}{r['second_half_pct']:>+10.1f}  {end}")
 
     print(f"\nШансы разгона: старт с разных дат каждые {args.step} дн., срок {args.horizon} дн., "
           f"цель +{args.target:g}%, аварийная остановка -{args.ruin:g}%:")
-    print(f"{'Выход':<14}{'Риск':>5}{'Стартов':>9}{'Цель':>8}{'Авария':>8}{'Ни то ни др.':>14}"
+    print(f"{'Выход':<22}{'Риск':>5}{'Стартов':>9}{'Цель':>8}{'Авария':>8}{'Ни то ни др.':>14}"
           f"{'Дней до цели':>14}{'Медиана итога':>15}")
-    for mode in modes:
+    for v in variants:
         for risk in risks:
-            o = acceleration_odds(prepared, params(mode, risk), args.horizon, args.step, first_ts)
+            o = acceleration_odds(prepared, params(v, risk), args.horizon, args.step, first_ts)
             days = f"{o['median_days_to_target']:.0f}" if o["median_days_to_target"] else "—"
-            print(f"{mode:<14}{risk:>4g}%{o['runs']:>9}{o['target_pct']:>7.0f}%{o['ruin_pct']:>7.0f}%"
+            print(f"{v[0]:<22}{risk:>4g}%{o['runs']:>9}{o['target_pct']:>7.0f}%{o['ruin_pct']:>7.0f}%"
                   f"{o['neither_pct']:>13.0f}%{days:>14}{o['median_return_pct']:>+14.1f}%")
 
     print("\nВажно: монеты выбраны по сегодняшнему объёму торгов. Те, что за эти годы "

@@ -21,30 +21,37 @@ def initial_take(mode, take):
     return None if mode == "trail_notake" else take
 
 
-def hit_price(side, stop, take, high, low):
-    """Цена выхода, если свеча задела стоп или тейк; если оба — консервативно стоп."""
+def hit_price(side, stop, take, high, low, open_=None):
+    """Цена выхода, если свеча задела стоп или тейк; если оба — консервативно стоп.
+
+    Если свеча открылась уже за стопом (ценовой разрыв), выход по цене открытия.
+    """
     if side == "long":
+        if open_ is not None and open_ <= stop:
+            return open_
         if low <= stop:
             return stop
         return take if take is not None and high >= take else None
+    if open_ is not None and open_ >= stop:
+        return open_
     if high >= stop:
         return stop
     return take if take is not None and low <= take else None
 
 
-def next_stop(mode, side, entry, initial_stop, stop, best):
+def next_stop(mode, side, entry, initial_stop, stop, best, activate_r=ACTIVATE_R, trail_r=TRAIL_R):
     """Стоп после закрытия свечи. best — лучшая цена с момента входа
     (максимум для лонга, минимум для шорта)."""
     if mode == "fixed":
         return stop
     r = abs(entry - initial_stop)
     d = 1 if side == "long" else -1
-    if (best - entry) * d < ACTIVATE_R * r:
+    if (best - entry) * d < activate_r * r:
         return stop
     if mode == "breakeven":
         new = entry * (1 + d * BREAKEVEN_BUFFER)
     else:
-        new = best - d * TRAIL_R * r
+        new = best - d * trail_r * r
     return max(stop, new) if side == "long" else min(stop, new)
 
 
